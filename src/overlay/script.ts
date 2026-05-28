@@ -18,14 +18,40 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
   // ── Activation ──────────────────────────────────────────────────────────────
 
+  // Parse the configured hotkey into { alt, ctrl, shift, meta, code } once.
+  // We match on e.code (physical key) so macOS' Alt-character substitution
+  // (Alt+S → "ß") doesn't break detection.
+  const hk = parseHotkey(HOTKEY);
+
   document.addEventListener('keydown', (e) => {
-    const key = [e.altKey && 'Alt', e.ctrlKey && 'Ctrl', e.shiftKey && 'Shift', e.key]
-      .filter(Boolean).join('+');
-    if (key === HOTKEY) {
+    if (active && e.key === 'Escape') { deactivate(); return; }
+    if (
+      !!e.altKey === hk.alt &&
+      !!e.ctrlKey === hk.ctrl &&
+      !!e.shiftKey === hk.shift &&
+      !!e.metaKey === hk.meta &&
+      e.code === hk.code
+    ) {
+      e.preventDefault();
       active ? deactivate() : activate();
     }
-    if (active && e.key === 'Escape') deactivate();
   });
+
+  function parseHotkey(str) {
+    const parts = str.split('+').map((p) => p.trim());
+    const mods = { alt: false, ctrl: false, shift: false, meta: false, code: 'KeyS' };
+    for (const p of parts) {
+      const low = p.toLowerCase();
+      if (low === 'alt' || low === 'option') mods.alt = true;
+      else if (low === 'ctrl' || low === 'control') mods.ctrl = true;
+      else if (low === 'shift') mods.shift = true;
+      else if (low === 'meta' || low === 'cmd' || low === 'command') mods.meta = true;
+      else if (/^[a-z]$/i.test(p)) mods.code = 'Key' + p.toUpperCase();
+      else if (/^[0-9]$/.test(p)) mods.code = 'Digit' + p;
+      else mods.code = p; // already a KeyboardEvent.code like 'Slash'
+    }
+    return mods;
+  }
 
   function activate() {
     active = true;
