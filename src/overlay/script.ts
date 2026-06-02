@@ -1,11 +1,11 @@
 import type { ResolvedSpoonOptions } from '../options.js'
 
 /**
- * Returns the self-contained browser JS that powers the spoon overlay.
- * Injected as an inline <script type="module"> by transformIndexHtml.
+ * Browser overlay for vite-plugin-spoon.
  *
- * Kept as a single string so it ships in one round trip with zero
- * client-side deps. Everything inside runs in the user's page.
+ * Shipped as a single inline IIFE so it lands in one round trip with
+ * zero client deps. The string is huge but each section is self-contained
+ * — read it top-to-bottom.
  */
 export function overlayScript(opts: ResolvedSpoonOptions): string {
   return `
@@ -13,27 +13,32 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   const HOTKEY = ${JSON.stringify(opts.hotkey)};
   const API = '/__spoon';
 
-  let active = false;
-  let panel = null;
-  let currentEl = null;
-  let panelWidth = Number(localStorage.getItem('__spoon_w')) || 360;
-  let tokens = { colors: [], spacing: [] };
+  // ── Tailwind helpers ──────────────────────────────────────────────────
+  // The default Tailwind v3 spacing scale — used by the spacing/size
+  // pickers. Projects with custom scales still work; we just show these
+  // as quick presets.
+  const SPACING_SCALE = [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 32];
 
-  // ── Hotkey handling — matches on physical e.code so macOS' Alt-letter
-  // substitution (Alt+S → "ß") doesn't break detection. ────────────────
+  // ── State ─────────────────────────────────────────────────────────────
+  const state = {
+    active: false,
+    panel: null,
+    pin: null,
+    currentEl: null,
+    tab: 'properties',
+    position: localStorage.getItem('__spoon_pos') || 'right',
+    panelWidth: Number(localStorage.getItem('__spoon_w')) || 360,
+    panelHeight: Number(localStorage.getItem('__spoon_h')) || 320,
+    floatPos: JSON.parse(localStorage.getItem('__spoon_float') || '{"x":80,"y":80}'),
+    tokens: { colors: [], spacing: [] },
+    undoStack: [],
+    redoStack: [],
+    historyOpenCount: 0,
+  };
+
+  // ── Hotkey parsing — matches on physical e.code so macOS' Alt-letter
+  // substitution doesn't break things ──────────────────────────────────
   const hk = parseHotkey(HOTKEY);
-  document.addEventListener('keydown', (e) => {
-    if (active && e.key === 'Escape') { deactivate(); return; }
-    if (
-      !!e.altKey === hk.alt && !!e.ctrlKey === hk.ctrl &&
-      !!e.shiftKey === hk.shift && !!e.metaKey === hk.meta &&
-      e.code === hk.code
-    ) {
-      e.preventDefault();
-      active ? deactivate() : activate();
-    }
-  });
-
   function parseHotkey(str) {
     const mods = { alt: false, ctrl: false, shift: false, meta: false, code: 'KeyS' };
     for (const p of str.split('+').map((x) => x.trim())) {
@@ -49,38 +54,295 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     return mods;
   }
 
+  document.addEventListener('keydown', (e) => {
+    // Toggle hotkey works regardless of mode
+    if (
+      !!e.altKey === hk.alt && !!e.ctrlKey === hk.ctrl &&
+      !!e.shiftKey === hk.shift && !!e.metaKey === hk.meta &&
+      e.code === hk.code
+    ) {
+      e.preventDefault();
+      state.active ? deactivate() : activate();
+      return;
+    }
+    if (!state.active) return;
+    if (e.key === 'Escape') { deactivate(); return; }
+
+    // Undo / Redo only while spoon is active so we don't shadow the app's own shortcuts.
+    if ((e.metaKey || e.ctrlKey) && e.code === 'KeyZ') {
+      e.preventDefault();
+      e.shiftKey ? redo() : undo();
+    }
+  });
+
   // ── Lifecycle ─────────────────────────────────────────────────────────
 
   async function activate() {
-    active = true;
+    state.active = true;
     document.body.style.cursor = 'crosshair';
     mountPanel();
-    showToolbar();
+    hidePin();
     document.addEventListener('mouseover', onHover, true);
     document.addEventListener('click', onClick, true);
+    document.addEventListener('dblclick', onDblClick, true);
     try {
-      const res = await fetch(API + '/tokens');
-      tokens = await res.json();
+      state.tokens = await (await fetch(API + '/tokens')).json();
     } catch {}
+    if (state.currentEl) renderTab(); // re-render now that tokens are in
   }
 
   function deactivate() {
-    active = false;
+    state.active = false;
     document.body.style.cursor = '';
     clearHighlight();
     unmountPanel();
-    hideToolbar();
-    currentEl = null;
+    state.currentEl = null;
     document.removeEventListener('mouseover', onHover, true);
     document.removeEventListener('click', onClick, true);
+    document.removeEventListener('dblclick', onDblClick, true);
+    mountPin(); // pin stays as the way back in
   }
 
-  // ── Hover highlight ───────────────────────────────────────────────────
+  // ── Edge-Pin (always visible when spoon is closed) ────────────────────
+
+  function mountPin() {
+    if (state.pin) return;
+    const pin = document.createElement('button');
+    Object.assign(pin.style, {
+      position: 'fixed', top: '50%', right: '0',
+      transform: 'translateY(-50%)',
+      background: '#1e1e2e', color: '#6366f1',
+      border: '1px solid #6366f1', borderRight: 'none',
+      borderRadius: '6px 0 0 6px', padding: '8px 6px',
+      cursor: 'pointer', zIndex: '2147483646',
+      fontFamily: 'monospace', fontSize: '14px',
+      writingMode: 'vertical-rl', letterSpacing: '.15em',
+      boxShadow: '-2px 0 12px rgba(99,102,241,0.25)',
+    });
+    pin.textContent = '⟡ spoon';
+    pin.title = 'Open spoon visual editor (' + HOTKEY + ')';
+    pin.onclick = () => activate();
+    document.body.appendChild(pin);
+    state.pin = pin;
+  }
+  function hidePin() { state.pin?.remove(); state.pin = null; }
+
+  // Mount the pin immediately on script load so the user always has an entry point
+  mountPin();
+
+  // ── Panel mounting + positioning ──────────────────────────────────────
+
+  function mountPanel() {
+    if (state.panel) return;
+    const panel = document.createElement('div');
+    panel.id = '__spoon-panel';
+    Object.assign(panel.style, {
+      position: 'fixed',
+      background: '#1e1e2e', color: '#cdd6f4',
+      boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      fontSize: '12px', zIndex: '2147483647',
+      display: 'flex', flexDirection: 'column',
+      border: '1px solid #313244',
+    });
+    panel.innerHTML =
+      headerHtml() +
+      tabBarHtml() +
+      '<div id="__spoon-body" style="overflow:auto;flex:1;padding:12px 14px;display:flex;flex-direction:column;gap:14px;"></div>' +
+      footerHtml();
+
+    document.body.appendChild(panel);
+    state.panel = panel;
+
+    // Wire up controls that don't depend on a selection
+    panel.querySelector('#__spoon-close').onclick = deactivate;
+    panel.querySelector('#__spoon-revert').onclick = revert;
+    panel.querySelector('#__spoon-apply').onclick = () => state.currentEl && applyEdits(state.currentEl);
+    panel.querySelector('#__spoon-undo').onclick = undo;
+    panel.querySelector('#__spoon-redo').onclick = redo;
+    panel.querySelectorAll('[data-tab]').forEach((b) => {
+      b.onclick = () => switchTab(b.getAttribute('data-tab'));
+    });
+    panel.querySelectorAll('[data-pos]').forEach((b) => {
+      b.onclick = () => setPosition(b.getAttribute('data-pos'));
+    });
+
+    applyPosition(state.position);
+    showEmptyState();
+  }
+
+  function unmountPanel() {
+    state.panel?.remove();
+    state.panel = null;
+    document.body.style.marginRight = '';
+    document.body.style.marginBottom = '';
+  }
+
+  function applyPosition(pos) {
+    state.position = pos;
+    localStorage.setItem('__spoon_pos', pos);
+    const p = state.panel;
+    if (!p) return;
+    // reset
+    Object.assign(p.style, {
+      top: '', right: '', bottom: '', left: '',
+      width: '', height: '', borderRadius: '0',
+      transform: '',
+    });
+    document.body.style.marginRight = '';
+    document.body.style.marginBottom = '';
+
+    // remove old grip
+    p.querySelector('#__spoon-grip')?.remove();
+
+    if (pos === 'right') {
+      Object.assign(p.style, { top: '0', right: '0', height: '100vh', width: state.panelWidth + 'px' });
+      document.body.style.transition = 'margin 0.15s ease';
+      document.body.style.marginRight = state.panelWidth + 'px';
+      addGrip(p, 'ew');
+    } else if (pos === 'bottom') {
+      Object.assign(p.style, { bottom: '0', left: '0', width: '100vw', height: state.panelHeight + 'px' });
+      document.body.style.transition = 'margin 0.15s ease';
+      document.body.style.marginBottom = state.panelHeight + 'px';
+      addGrip(p, 'ns');
+    } else if (pos === 'floating') {
+      Object.assign(p.style, {
+        top: state.floatPos.y + 'px', left: state.floatPos.x + 'px',
+        width: state.panelWidth + 'px', height: '60vh',
+        borderRadius: '10px',
+      });
+      makeFloatable(p);
+    }
+    // highlight active position button
+    p.querySelectorAll('[data-pos]').forEach((b) => {
+      b.style.background = b.getAttribute('data-pos') === pos ? '#313244' : 'transparent';
+    });
+  }
+
+  function setPosition(pos) { applyPosition(pos); }
+
+  function addGrip(panel, axis) {
+    const grip = document.createElement('div');
+    grip.id = '__spoon-grip';
+    Object.assign(grip.style, {
+      position: 'absolute',
+      cursor: axis === 'ew' ? 'ew-resize' : 'ns-resize',
+      background: 'transparent',
+      ...(axis === 'ew'
+        ? { top: '0', left: '0', width: '4px', height: '100%' }
+        : { top: '0', left: '0', height: '4px', width: '100%' }),
+    });
+    grip.addEventListener('mousedown', (e) => startResize(e, axis));
+    panel.appendChild(grip);
+  }
+
+  function startResize(e, axis) {
+    e.preventDefault();
+    const start = axis === 'ew' ? e.clientX : e.clientY;
+    const startW = state.panelWidth;
+    const startH = state.panelHeight;
+    const onMove = (ev) => {
+      if (axis === 'ew') {
+        const next = Math.max(280, Math.min(720, startW + (start - ev.clientX)));
+        state.panelWidth = next;
+        state.panel.style.width = next + 'px';
+        document.body.style.marginRight = next + 'px';
+      } else {
+        const next = Math.max(180, Math.min(window.innerHeight - 100, startH + (start - ev.clientY)));
+        state.panelHeight = next;
+        state.panel.style.height = next + 'px';
+        document.body.style.marginBottom = next + 'px';
+      }
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      localStorage.setItem('__spoon_w', String(state.panelWidth));
+      localStorage.setItem('__spoon_h', String(state.panelHeight));
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }
+
+  function makeFloatable(panel) {
+    const header = panel.querySelector('#__spoon-header');
+    header.style.cursor = 'move';
+    header.addEventListener('mousedown', (e) => {
+      if (e.target.closest('button')) return; // don't drag from buttons
+      e.preventDefault();
+      const startX = e.clientX, startY = e.clientY;
+      const startLeft = state.floatPos.x, startTop = state.floatPos.y;
+      const onMove = (ev) => {
+        const x = Math.max(0, Math.min(window.innerWidth - 200, startLeft + (ev.clientX - startX)));
+        const y = Math.max(0, Math.min(window.innerHeight - 100, startTop + (ev.clientY - startY)));
+        state.floatPos = { x, y };
+        panel.style.left = x + 'px';
+        panel.style.top = y + 'px';
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        localStorage.setItem('__spoon_float', JSON.stringify(state.floatPos));
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  }
+
+  // ── Header / tabs / footer markup ─────────────────────────────────────
+
+  function headerHtml() {
+    return \`<div id="__spoon-header" style="padding:9px 12px;background:#181825;display:flex;align-items:center;gap:6px;border-bottom:1px solid #313244;flex-shrink:0;">
+      <span style="color:#6366f1;font-weight:700">⟡</span>
+      <div id="__spoon-breadcrumb" style="flex:1;color:#585b70;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;gap:2px;align-items:center"></div>
+      <div style="display:flex;gap:1px;background:#11111b;border-radius:4px;padding:2px;margin-left:6px;">
+        \${posButton('right',    \`<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="13" height="13" rx="1"/><line x1="10" y1="1.5" x2="10" y2="14.5"/></svg>\`, 'Dock right')}
+        \${posButton('bottom',   \`<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="13" height="13" rx="1"/><line x1="1.5" y1="10" x2="14.5" y2="10"/></svg>\`, 'Dock bottom')}
+        \${posButton('floating', \`<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3.5" y="3.5" width="9" height="9" rx="1"/></svg>\`, 'Floating')}
+      </div>
+      <button id="__spoon-close" style="background:none;border:none;color:#585b70;cursor:pointer;font-size:18px;line-height:1;padding:0 4px;margin-left:4px" title="Close (Esc)">×</button>
+    </div>\`;
+  }
+  function posButton(pos, svg, title) {
+    return \`<button data-pos="\${pos}" title="\${title}" style="background:transparent;border:none;border-radius:3px;padding:3px 5px;cursor:pointer;color:#a6adc8;display:flex;align-items:center;line-height:0">\${svg}</button>\`;
+  }
+  function tabBarHtml() {
+    return \`<div style="display:flex;background:#11111b;border-bottom:1px solid #313244;flex-shrink:0;">
+      \${tabBtn('properties', 'Properties')}
+      \${tabBtn('raw',        'Raw')}
+      \${tabBtn('history',    'History')}
+    </div>\`;
+  }
+  function tabBtn(id, label) {
+    return \`<button data-tab="\${id}" style="flex:1;background:transparent;border:none;color:#a6adc8;padding:7px 8px;cursor:pointer;font-family:inherit;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid transparent">\${label}</button>\`;
+  }
+  function footerHtml() {
+    return \`<div style="padding:8px 12px;background:#181825;border-top:1px solid #313244;display:flex;gap:6px;align-items:center;flex-shrink:0;">
+      <button id="__spoon-undo" title="Undo (Cmd+Z)" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:5px 8px;cursor:pointer;font-size:13px">↶</button>
+      <button id="__spoon-redo" title="Redo (Cmd+Shift+Z)" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:5px 8px;cursor:pointer;font-size:13px">↷</button>
+      <div id="__spoon-status" style="flex:1;font-size:11px;color:#a6e3a1;min-height:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+      <button id="__spoon-revert" style="background:#313244;color:#cdd6f4;border:none;border-radius:5px;padding:6px 10px;cursor:pointer;font-size:12px">Revert</button>
+      <button id="__spoon-apply" style="background:#6366f1;color:#fff;border:none;border-radius:5px;padding:6px 12px;cursor:pointer;font-size:12px;font-weight:600">Apply →</button>
+    </div>\`;
+  }
+
+  function switchTab(tab) {
+    state.tab = tab;
+    state.panel.querySelectorAll('[data-tab]').forEach((b) => {
+      const active = b.getAttribute('data-tab') === tab;
+      b.style.color = active ? '#cdd6f4' : '#a6adc8';
+      b.style.borderBottomColor = active ? '#6366f1' : 'transparent';
+      b.style.background = active ? '#1e1e2e' : 'transparent';
+    });
+    renderTab();
+  }
+
+  // ── Selection & hover ─────────────────────────────────────────────────
 
   let highlightEl = null;
   function onHover(e) {
+    if (state.panel?.contains(e.target)) return;
     if (e.target === highlightEl) return;
-    if (panel && panel.contains(e.target)) return;
     clearHighlight();
     const el = e.target;
     if (!el.dataset || !el.dataset.spoonLoc) return;
@@ -97,18 +359,151 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       highlightEl = null;
     }
   }
-
   function onClick(e) {
-    if (panel && panel.contains(e.target)) return;
+    if (state.panel?.contains(e.target)) return;
     const el = e.target.closest('[data-spoon-loc]');
     if (!el) return;
     e.preventDefault();
     e.stopPropagation();
-    openPanel(el);
+    selectElement(el);
+  }
+  function onDblClick(e) {
+    if (state.panel?.contains(e.target)) return;
+    const el = e.target.closest('[data-spoon-loc]');
+    if (!el) return;
+    // Only allow inline edit if element holds a single text node
+    if (!(el.childNodes.length === 1 && el.firstChild.nodeType === 3)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    selectElement(el);
+    inlineEditText(el);
+  }
+
+  function inlineEditText(el) {
+    const orig = el.firstChild.textContent;
+    el.setAttribute('contenteditable', 'true');
+    el._spoonOldOutline = el.style.outline;
+    el.style.outline = '2px dashed #f9e2af';
+    el.focus();
+    document.getSelection()?.selectAllChildren(el);
+
+    const finish = (save) => {
+      el.removeAttribute('contenteditable');
+      el.style.outline = el._spoonOldOutline || '';
+      el.removeEventListener('blur', onBlur);
+      el.removeEventListener('keydown', onKey);
+      const next = el.firstChild?.textContent ?? '';
+      if (save && next !== orig) {
+        // restore text temporarily so applyEdits sees the diff between orig and current
+        // (panel.dataset.origText holds the baseline)
+        if (state.currentEl === el) {
+          state.panel.dataset.origText = orig;
+          applyEdits(el);
+        }
+      } else if (!save) {
+        el.firstChild.textContent = orig;
+      }
+    };
+    const onBlur = () => finish(true);
+    const onKey = (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); el.blur(); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); finish(false); el.blur(); }
+    };
+    el.addEventListener('blur', onBlur);
+    el.addEventListener('keydown', onKey);
+  }
+
+  function selectElement(el) {
+    if (!state.panel) mountPanel();
+    if (state.currentEl === el) return;
+    if (state.currentEl && state.panel.dataset.origClass !== undefined) {
+      // discard any unsaved tweaks on the previously selected element
+      state.currentEl.className = state.panel.dataset.origClass;
+      if (state.panel.dataset.origText !== undefined && state.currentEl.firstChild) {
+        state.currentEl.firstChild.textContent = state.panel.dataset.origText;
+      }
+    }
+    state.currentEl = el;
+    state.panel.dataset.origClass = el.className || '';
+    const initialText = el.childNodes.length === 1 && el.firstChild.nodeType === 3
+      ? el.firstChild.textContent : null;
+    if (initialText !== null) state.panel.dataset.origText = initialText;
+    else delete state.panel.dataset.origText;
+
+    renderBreadcrumb(el);
+    setStatus('');
+    renderTab();
+  }
+
+  function showEmptyState() {
+    const body = state.panel.querySelector('#__spoon-body');
+    body.innerHTML = '<div style="color:#585b70;text-align:center;padding:40px 0;font-size:12px">Click any element to start editing</div>';
+    state.panel.querySelector('#__spoon-breadcrumb').textContent = '';
+    switchTab(state.tab);
+  }
+
+  // ── Breadcrumb (climb parent chain) ───────────────────────────────────
+
+  function renderBreadcrumb(el) {
+    const chain = [];
+    let cur = el;
+    while (cur && cur !== document.body && chain.length < 6) {
+      if (cur.dataset && cur.dataset.spoonLoc) chain.unshift(cur);
+      cur = cur.parentElement;
+    }
+    const bc = state.panel.querySelector('#__spoon-breadcrumb');
+    bc.innerHTML = '';
+    chain.forEach((node, i) => {
+      if (i > 0) {
+        const sep = document.createElement('span');
+        sep.textContent = '›';
+        sep.style.color = '#45475a';
+        bc.appendChild(sep);
+      }
+      const btn = document.createElement('button');
+      btn.textContent = node.tagName.toLowerCase();
+      Object.assign(btn.style, {
+        background: node === el ? '#313244' : 'transparent',
+        color: node === el ? '#cdd6f4' : '#6c7086',
+        border: 'none', borderRadius: '3px', padding: '1px 5px',
+        cursor: 'pointer', fontFamily: 'inherit', fontSize: '10px',
+      });
+      btn.onmouseenter = () => previewHighlight(node, true);
+      btn.onmouseleave = () => previewHighlight(node, false);
+      btn.onclick = () => selectElement(node);
+      bc.appendChild(btn);
+    });
+  }
+
+  function previewHighlight(el, on) {
+    if (on) {
+      el._spoonPreviewOldOutline = el.style.outline;
+      el.style.outline = '2px dashed #6366f1';
+    } else {
+      el.style.outline = el._spoonPreviewOldOutline || '';
+    }
+  }
+
+  // ── Tab rendering ─────────────────────────────────────────────────────
+
+  function renderTab() {
+    if (!state.panel) return;
+    const body = state.panel.querySelector('#__spoon-body');
+    body.innerHTML = '';
+
+    if (state.tab === 'history') {
+      renderHistoryTab(body);
+      return;
+    }
+    if (!state.currentEl) {
+      body.innerHTML = '<div style="color:#585b70;text-align:center;padding:40px 0;font-size:12px">Click any element to start editing</div>';
+      return;
+    }
+    if (state.tab === 'properties') renderPropertiesTab(body, state.currentEl);
+    else if (state.tab === 'raw') renderRawTab(body, state.currentEl);
   }
 
   // ── Class taxonomy ────────────────────────────────────────────────────
-  // Each entry: [groupId, predicate]. First match wins.
 
   const GROUPS = [
     ['layout',     /^(flex|grid|block|inline|inline-block|inline-flex|inline-grid|hidden|table|contents|flow-root|isolate|isolation-|float-|clear-|object-|overflow-|overscroll-|position-|static|fixed|absolute|relative|sticky|inset-|top-|right-|bottom-|left-|z-|order-|col-|row-|grid-|gap-|items-|justify-|content-|self-|place-|basis-|grow|shrink|wrap|nowrap|flex-)/],
@@ -118,17 +513,12 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     ['typography',/^(font-|text-(xs|sm|base|lg|xl|2xl|3xl|4xl|5xl|6xl|7xl|8xl|9xl|left|center|right|justify|start|end)|leading-|tracking-|whitespace-|break-|truncate|uppercase|lowercase|capitalize|normal-case|italic|not-italic|underline|overline|line-through|no-underline|antialiased|subpixel-antialiased)/],
     ['effects',   /^(rounded|border|shadow|opacity-|blur|brightness|contrast|grayscale|hue-rotate|invert|saturate|sepia|backdrop-|transition|duration-|delay-|ease-|animate-|transform|translate|rotate|scale|skew|origin-|cursor-|select-|pointer-events-|user-select-)/],
   ];
-
   function classifyToken(cls) {
-    // strip variant prefixes (hover:, md:, dark:, group-hover:, etc.)
     const bareIdx = cls.lastIndexOf(':');
     const bare = bareIdx >= 0 ? cls.slice(bareIdx + 1) : cls;
-    for (const [id, re] of GROUPS) {
-      if (re.test(bare)) return id;
-    }
+    for (const [id, re] of GROUPS) if (re.test(bare)) return id;
     return 'other';
   }
-
   function parseClasses(str) {
     const tokens = (str || '').split(/\\s+/).filter(Boolean);
     const groups = { layout: [], spacing: [], sizing: [], color: [], typography: [], effects: [], other: [] };
@@ -136,147 +526,28 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     return groups;
   }
 
-  function flattenGroups(groups) {
-    return [
-      ...groups.layout, ...groups.spacing, ...groups.sizing,
-      ...groups.color, ...groups.typography, ...groups.effects, ...groups.other,
-    ];
+  // ── Class manipulation helpers ────────────────────────────────────────
+
+  function classList(el) { return (el.className || '').split(/\\s+/).filter(Boolean); }
+  function setClassList(el, arr) { el.className = arr.join(' '); }
+  function removeClass(el, cls) { setClassList(el, classList(el).filter((c) => c !== cls)); }
+  function addClass(el, cls) {
+    const set = new Set(classList(el));
+    set.add(cls);
+    setClassList(el, Array.from(set));
+  }
+  /** Remove any class matching the prefix-regex, then optionally add a new one. */
+  function replacePrefixed(el, prefixRe, nextClass) {
+    const next = classList(el).filter((c) => !prefixRe.test(c));
+    if (nextClass) next.push(nextClass);
+    setClassList(el, next);
+  }
+  /** Find the first class matching a prefix-regex. */
+  function findPrefixed(el, prefixRe) {
+    return classList(el).find((c) => prefixRe.test(c)) || '';
   }
 
-  // ── Sidepanel (mounted once on activate, content swapped per selection) ─
-
-  function mountPanel() {
-    if (panel) return;
-    panel = document.createElement('div');
-    panel.id = '__spoon-panel';
-    Object.assign(panel.style, {
-      position: 'fixed', top: '0', right: '0', height: '100vh',
-      width: panelWidth + 'px',
-      background: '#1e1e2e', color: '#cdd6f4',
-      boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-      fontSize: '12px', zIndex: '2147483647',
-      borderLeft: '1px solid #313244',
-      display: 'flex', flexDirection: 'column',
-    });
-
-    panel.innerHTML =
-      headerHtml() +
-      '<div id="__spoon-body" style="overflow:auto;flex:1;padding:12px 14px;display:flex;flex-direction:column;gap:14px;"></div>' +
-      footerHtml();
-
-    // Resize handle on the left edge
-    const grip = document.createElement('div');
-    Object.assign(grip.style, {
-      position: 'absolute', top: '0', left: '0',
-      width: '4px', height: '100%', cursor: 'ew-resize',
-      background: 'transparent',
-    });
-    grip.addEventListener('mousedown', startResize);
-    panel.appendChild(grip);
-
-    document.body.appendChild(panel);
-    document.body.style.transition = 'margin-right 0.15s ease';
-    document.body.style.marginRight = panelWidth + 'px';
-
-    panel.querySelector('#__spoon-close').onclick = deactivate;
-    panel.querySelector('#__spoon-cancel').onclick = cancelEdits;
-    panel.querySelector('#__spoon-apply').onclick = () => {
-      if (!currentEl) return;
-      applyEdits(currentEl);
-    };
-
-    showEmptyState();
-  }
-
-  function unmountPanel() {
-    panel?.remove();
-    panel = null;
-    document.body.style.marginRight = '';
-  }
-
-  function openPanel(el) {
-    if (!panel) mountPanel();
-    if (currentEl === el) return;
-
-    // If we're switching elements, revert any unsaved changes on the old one
-    if (currentEl && panel.dataset.origClass !== undefined) {
-      currentEl.className = panel.dataset.origClass;
-      if (panel.dataset.origText !== undefined && currentEl.firstChild) {
-        currentEl.firstChild.textContent = panel.dataset.origText;
-      }
-    }
-
-    currentEl = el;
-    const initialClass = el.className || '';
-    const initialText = el.childNodes.length === 1 && el.firstChild.nodeType === 3
-      ? el.firstChild.textContent : null;
-
-    panel.dataset.origClass = initialClass;
-    if (initialText !== null) panel.dataset.origText = initialText;
-    else delete panel.dataset.origText;
-
-    panel.querySelector('#__spoon-loc').textContent = el.dataset.spoonLoc;
-    setStatus('');
-    renderBody(el, initialText);
-  }
-
-  function showEmptyState() {
-    const body = panel.querySelector('#__spoon-body');
-    body.innerHTML = '';
-    const hint = document.createElement('div');
-    Object.assign(hint.style, { color: '#585b70', fontSize: '12px', padding: '40px 0', textAlign: 'center' });
-    hint.textContent = 'Click any element to start editing';
-    body.appendChild(hint);
-    panel.querySelector('#__spoon-loc').textContent = '';
-  }
-
-  function cancelEdits() {
-    if (!currentEl) return;
-    currentEl.className = panel.dataset.origClass;
-    if (panel.dataset.origText !== undefined && currentEl.firstChild) {
-      currentEl.firstChild.textContent = panel.dataset.origText;
-    }
-    renderBody(currentEl, panel.dataset.origText ?? null);
-    setStatus('Reverted.');
-  }
-
-  function startResize(e) {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startW = panelWidth;
-    const onMove = (ev) => {
-      const next = Math.max(280, Math.min(720, startW + (startX - ev.clientX)));
-      panelWidth = next;
-      panel.style.width = next + 'px';
-      document.body.style.marginRight = next + 'px';
-    };
-    const onUp = () => {
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-      localStorage.setItem('__spoon_w', String(panelWidth));
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-  }
-
-  function headerHtml() {
-    return \`<div style="padding:10px 14px;background:#181825;display:flex;align-items:center;gap:8px;border-bottom:1px solid #313244;flex-shrink:0;">
-      <span style="color:#6366f1;font-weight:700">⟡ spoon</span>
-      <span id="__spoon-loc" style="flex:1;color:#585b70;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
-      <button id="__spoon-close" style="background:none;border:none;color:#585b70;cursor:pointer;font-size:18px;line-height:1;padding:0" title="Close (Esc)">×</button>
-    </div>\`;
-  }
-
-  function footerHtml() {
-    return \`<div style="padding:10px 14px;background:#181825;border-top:1px solid #313244;display:flex;gap:6px;align-items:center;flex-shrink:0;">
-      <div id="__spoon-status" style="flex:1;font-size:11px;color:#a6e3a1;min-height:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
-      <button id="__spoon-cancel" style="background:#313244;color:#cdd6f4;border:none;border-radius:5px;padding:6px 10px;cursor:pointer;font-size:12px">Revert</button>
-      <button id="__spoon-apply" style="background:#6366f1;color:#fff;border:none;border-radius:5px;padding:6px 12px;cursor:pointer;font-size:12px;font-weight:600">Apply →</button>
-    </div>\`;
-  }
-
-  // ── Body rendering ────────────────────────────────────────────────────
+  // ── Properties tab ─────────────────────────────────────────────────────
 
   const GROUP_META = {
     layout:     { label: 'Layout',     color: '#89b4fa' },
@@ -288,119 +559,452 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     other:      { label: 'Other',      color: '#bac2de' },
   };
 
-  function renderBody(el, initialText) {
-    const body = panel.querySelector('#__spoon-body');
-    body.innerHTML = '';
-
-    if (initialText !== null) {
+  function renderPropertiesTab(body, el) {
+    // Text editor at top, if element has a single text child
+    if (el.childNodes.length === 1 && el.firstChild.nodeType === 3) {
       body.appendChild(textSection(el));
     }
+    // Visual editors (Phase 3.1–3.3) — placeholders to be filled by next commit
+    body.appendChild(layoutSection(el));
+    body.appendChild(sizingSection(el));
+    body.appendChild(spacingSection(el));
 
+    // Existing class-chip sections per category
     const groups = parseClasses(el.className);
     for (const id of Object.keys(GROUP_META)) {
-      const items = groups[id];
-      if (id === 'color') {
-        body.appendChild(colorSection(el, items));
-      } else {
-        body.appendChild(genericSection(el, id, items));
-      }
+      if (id === 'spacing' || id === 'sizing' || id === 'layout') continue; // covered by visual editors above
+      if (id === 'color') body.appendChild(colorSection(el));
+      else body.appendChild(chipSection(el, id));
     }
-
-    body.appendChild(rawSection(el));
   }
 
   function textSection(el) {
     const wrap = section('Text', '#f9e2af');
+    const hint = document.createElement('div');
+    hint.textContent = 'Tip: double-click text in the page to edit inline';
+    Object.assign(hint.style, { fontSize: '10px', color: '#585b70', marginBottom: '4px' });
+    wrap.appendChild(hint);
     const input = document.createElement('input');
     input.type = 'text';
     input.value = el.firstChild?.textContent ?? '';
     Object.assign(input.style, inputStyle());
+    input.dataset.role = 'text-input';
     input.addEventListener('input', () => {
       if (el.firstChild) el.firstChild.textContent = input.value;
     });
-    input.dataset.role = 'text-input';
     wrap.appendChild(input);
     return wrap;
   }
 
-  function genericSection(el, groupId, items) {
-    const meta = GROUP_META[groupId];
-    const wrap = section(meta.label, meta.color);
+  // ── Layout section: Display + Alignment (Phase 3.2 — placeholder UI) ──
 
-    const chipRow = document.createElement('div');
-    Object.assign(chipRow.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
-    wrap.appendChild(chipRow);
+  function layoutSection(el) {
+    const wrap = section('Layout', GROUP_META.layout.color);
 
-    const renderChips = () => {
-      chipRow.innerHTML = '';
-      const groups = parseClasses(el.className);
-      for (const cls of groups[groupId]) {
-        chipRow.appendChild(chip(cls, meta.color, () => removeClass(el, cls, () => renderChips())));
-      }
-      chipRow.appendChild(addInput(el, groupId, () => renderChips()));
-    };
-    renderChips();
-    return wrap;
-  }
+    const displayRow = buttonRow('Display', [
+      ['block',        'Block'],
+      ['flex',         'Flex'],
+      ['inline-flex',  'I-Flex'],
+      ['grid',         'Grid'],
+      ['inline-block', 'Inline'],
+      ['hidden',       'Hidden'],
+    ], (val) => {
+      replacePrefixed(el, /^(block|inline-block|inline|flex|inline-flex|grid|inline-grid|hidden|table|contents|flow-root)$/, val);
+      renderTab();
+    }, (val) => classList(el).includes(val));
+    wrap.appendChild(displayRow);
 
-  function colorSection(el, items) {
-    const meta = GROUP_META.color;
-    const wrap = section(meta.label, meta.color);
+    const cur = classList(el);
+    if (cur.includes('flex') || cur.includes('inline-flex')) {
+      wrap.appendChild(buttonRow('Items', [
+        ['items-start',    '⊤'],
+        ['items-center',   '⊕'],
+        ['items-end',      '⊥'],
+        ['items-stretch',  '↔'],
+        ['items-baseline', 'B'],
+      ], (val) => { replacePrefixed(el, /^items-/, val); renderTab(); }, (val) => cur.includes(val)));
 
-    const chipRow = document.createElement('div');
-    Object.assign(chipRow.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
-    wrap.appendChild(chipRow);
+      wrap.appendChild(buttonRow('Justify', [
+        ['justify-start',   '⊢'],
+        ['justify-center',  '═'],
+        ['justify-end',     '⊣'],
+        ['justify-between', '⇔'],
+        ['justify-around',  '⊟'],
+        ['justify-evenly',  '⊞'],
+      ], (val) => { replacePrefixed(el, /^justify-/, val); renderTab(); }, (val) => cur.includes(val)));
 
-    const renderChips = () => {
-      chipRow.innerHTML = '';
-      const groups = parseClasses(el.className);
-      for (const cls of groups.color) {
-        chipRow.appendChild(chip(cls, meta.color, () => removeClass(el, cls, () => renderChips())));
-      }
-      chipRow.appendChild(addInput(el, 'color', () => renderChips()));
-    };
-    renderChips();
-
-    if (tokens.colors && tokens.colors.length > 0) {
-      const label = document.createElement('div');
-      label.textContent = 'Theme tokens';
-      Object.assign(label.style, { fontSize: '10px', color: '#585b70', marginTop: '6px', textTransform: 'uppercase', letterSpacing: '.06em' });
-      wrap.appendChild(label);
-
-      const swatchRow = document.createElement('div');
-      Object.assign(swatchRow.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
-      for (const tk of tokens.colors) {
-        swatchRow.appendChild(colorSwatch(tk, el, renderChips));
-      }
-      wrap.appendChild(swatchRow);
+      wrap.appendChild(buttonRow('Direction', [
+        ['flex-row',         '→'],
+        ['flex-col',         '↓'],
+        ['flex-row-reverse', '←'],
+        ['flex-col-reverse', '↑'],
+      ], (val) => { replacePrefixed(el, /^flex-(row|col)(-reverse)?$/, val); renderTab(); }, (val) => cur.includes(val)));
     }
 
     return wrap;
   }
 
-  function rawSection(el) {
-    const wrap = section('Raw className', '#585b70');
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.value = el.className;
-    Object.assign(input.style, inputStyle());
-    input.style.fontSize = '11px';
-    input.addEventListener('input', () => {
-      el.className = input.value;
-    });
-    input.addEventListener('blur', () => {
-      // re-render groups when leaving raw editor
-      renderBody(el, el.firstChild?.nodeType === 3 ? el.firstChild.textContent : null);
-    });
-    wrap.appendChild(input);
+  // ── Sizing section (Phase 3.3 — placeholder UI) ───────────────────────
+
+  function sizingSection(el) {
+    const wrap = section('Size', GROUP_META.sizing.color);
+    wrap.appendChild(sizeRow(el, 'w', 'Width'));
+    wrap.appendChild(sizeRow(el, 'h', 'Height'));
     return wrap;
+  }
+
+  function sizeRow(el, dim, label) {
+    const row = document.createElement('div');
+    Object.assign(row.style, { display: 'flex', alignItems: 'center', gap: '6px' });
+
+    const lbl = document.createElement('span');
+    lbl.textContent = label;
+    Object.assign(lbl.style, { fontSize: '11px', color: '#a6adc8', width: '50px' });
+    row.appendChild(lbl);
+
+    const cur = findPrefixed(el, new RegExp('^' + dim + '-'));
+    const mode = !cur ? 'auto' : /-(full|screen)$/.test(cur) ? 'fill' : /\\[/.test(cur) ? 'fixed' : 'preset';
+
+    const modeSel = document.createElement('select');
+    Object.assign(modeSel.style, selectStyle());
+    for (const m of ['auto', 'preset', 'fixed', 'fill']) {
+      const opt = document.createElement('option');
+      opt.value = m; opt.textContent = m;
+      if (m === mode) opt.selected = true;
+      modeSel.appendChild(opt);
+    }
+    row.appendChild(modeSel);
+
+    const valueInput = document.createElement('input');
+    valueInput.type = 'text';
+    valueInput.placeholder = mode === 'fixed' ? '124px' : '4';
+    if (mode === 'fixed' && cur) valueInput.value = cur.match(/\\[(.+)\\]/)?.[1] ?? '';
+    else if (mode === 'preset' && cur) valueInput.value = cur.replace(dim + '-', '');
+    Object.assign(valueInput.style, { ...inputStyle(), flex: '1' });
+    row.appendChild(valueInput);
+
+    const update = () => {
+      const m = modeSel.value;
+      const re = new RegExp('^' + dim + '-');
+      if (m === 'auto') { replacePrefixed(el, re, dim + '-auto'); }
+      else if (m === 'fill') { replacePrefixed(el, re, dim + '-full'); }
+      else if (m === 'preset') {
+        const v = valueInput.value.trim();
+        if (v) replacePrefixed(el, re, dim + '-' + v);
+      } else if (m === 'fixed') {
+        const v = valueInput.value.trim();
+        if (v) replacePrefixed(el, re, dim + '-[' + v + ']');
+      }
+    };
+    modeSel.addEventListener('change', update);
+    valueInput.addEventListener('change', update);
+
+    return row;
+  }
+
+  // ── Spacing-Box (Phase 3.1 — placeholder, filled in next commit) ──────
+
+  function spacingSection(el) {
+    const wrap = section('Spacing', GROUP_META.spacing.color);
+    const hint = document.createElement('div');
+    hint.textContent = 'Visual margin/padding editor coming next';
+    Object.assign(hint.style, { fontSize: '10px', color: '#585b70', fontStyle: 'italic' });
+    wrap.appendChild(hint);
+
+    // For now, render the existing chip-based editor for spacing classes
+    const meta = GROUP_META.spacing;
+    const chipRow = document.createElement('div');
+    Object.assign(chipRow.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
+    const refresh = () => {
+      chipRow.innerHTML = '';
+      const groups = parseClasses(el.className);
+      for (const cls of groups.spacing) {
+        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); refresh(); }));
+      }
+      chipRow.appendChild(addInput(el, refresh));
+    };
+    refresh();
+    wrap.appendChild(chipRow);
+    return wrap;
+  }
+
+  function chipSection(el, groupId) {
+    const meta = GROUP_META[groupId];
+    const wrap = section(meta.label, meta.color);
+    const chipRow = document.createElement('div');
+    Object.assign(chipRow.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
+    const refresh = () => {
+      chipRow.innerHTML = '';
+      const groups = parseClasses(el.className);
+      for (const cls of groups[groupId]) {
+        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); refresh(); }));
+      }
+      chipRow.appendChild(addInput(el, refresh));
+    };
+    refresh();
+    wrap.appendChild(chipRow);
+    return wrap;
+  }
+
+  function colorSection(el) {
+    const meta = GROUP_META.color;
+    const wrap = section(meta.label, meta.color);
+    const chipRow = document.createElement('div');
+    Object.assign(chipRow.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
+    const refresh = () => {
+      chipRow.innerHTML = '';
+      const groups = parseClasses(el.className);
+      for (const cls of groups.color) {
+        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); refresh(); }));
+      }
+      chipRow.appendChild(addInput(el, refresh));
+    };
+    refresh();
+    wrap.appendChild(chipRow);
+
+    if (state.tokens.colors && state.tokens.colors.length > 0) {
+      const lbl = document.createElement('div');
+      lbl.textContent = 'Theme tokens — click to set bg-';
+      Object.assign(lbl.style, { fontSize: '10px', color: '#585b70', marginTop: '6px', textTransform: 'uppercase', letterSpacing: '.06em' });
+      wrap.appendChild(lbl);
+      const swatches = document.createElement('div');
+      Object.assign(swatches.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
+      for (const tk of state.tokens.colors) {
+        swatches.appendChild(colorSwatch(tk, el, refresh));
+      }
+      wrap.appendChild(swatches);
+    }
+    return wrap;
+  }
+
+  // ── Raw tab ───────────────────────────────────────────────────────────
+
+  function renderRawTab(body, el) {
+    const cls = section('Class names', '#585b70');
+    const ta = document.createElement('textarea');
+    ta.value = el.className;
+    Object.assign(ta.style, { ...inputStyle(), minHeight: '80px', resize: 'vertical', fontFamily: 'inherit' });
+    ta.addEventListener('input', () => { el.className = ta.value; });
+    cls.appendChild(ta);
+    body.appendChild(cls);
+
+    if (el.childNodes.length === 1 && el.firstChild.nodeType === 3) {
+      const txt = section('Text', '#f9e2af');
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = el.firstChild.textContent ?? '';
+      input.dataset.role = 'text-input';
+      Object.assign(input.style, inputStyle());
+      input.addEventListener('input', () => { el.firstChild.textContent = input.value; });
+      txt.appendChild(input);
+      body.appendChild(txt);
+    }
+  }
+
+  // ── History tab ───────────────────────────────────────────────────────
+
+  async function renderHistoryTab(body) {
+    const wrap = section('History', '#bac2de');
+    const stackInfo = document.createElement('div');
+    Object.assign(stackInfo.style, { fontSize: '11px', color: '#585b70' });
+    stackInfo.textContent = \`Undo stack: \${state.undoStack.length} · Redo stack: \${state.redoStack.length}\`;
+    wrap.appendChild(stackInfo);
+    body.appendChild(wrap);
+
+    const list = section('Saved changes', '#585b70');
+    body.appendChild(list);
+
+    const loading = document.createElement('div');
+    loading.textContent = 'Loading…';
+    Object.assign(loading.style, { color: '#585b70', fontSize: '11px' });
+    list.appendChild(loading);
+
+    let entries = [];
+    try {
+      entries = (await (await fetch(API + '/history')).json()).entries || [];
+    } catch {}
+    loading.remove();
+
+    if (entries.length === 0) {
+      const empty = document.createElement('div');
+      empty.textContent = 'No saved changes yet — apply something and it will show up here.';
+      Object.assign(empty.style, { color: '#585b70', fontSize: '11px', fontStyle: 'italic' });
+      list.appendChild(empty);
+      return;
+    }
+
+    for (const e of entries) {
+      const row = document.createElement('div');
+      Object.assign(row.style, {
+        display: 'flex', flexDirection: 'column', gap: '2px',
+        padding: '6px 8px', borderRadius: '5px', background: '#181825',
+        cursor: 'pointer', border: '1px solid #313244',
+      });
+      const time = new Date(e.ts).toLocaleString();
+      const fileShort = (e.file || '').split('/').slice(-2).join('/');
+      row.innerHTML = \`
+        <div style="display:flex;justify-content:space-between;gap:6px;align-items:baseline">
+          <span style="color:#cdd6f4;font-size:11px;font-weight:600">\${esc(e.label)}</span>
+          <span style="color:#45475a;font-size:10px">\${esc(time)}</span>
+        </div>
+        <div style="color:#6c7086;font-size:10px">\${esc(fileShort)}</div>
+      \`;
+      row.title = 'Click to restore the state before this change';
+      row.onclick = () => restoreEntry(e);
+      list.appendChild(row);
+    }
+  }
+
+  async function restoreEntry(entry) {
+    if (!entry.inverse || entry.inverse.length === 0) {
+      setStatus('Marker entry — nothing to restore.');
+      return;
+    }
+    setStatus('Restoring…');
+    try {
+      const res = await fetch(API + '/write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file: entry.file, patches: entry.inverse, label: 'Restore @ ' + new Date(entry.ts).toLocaleTimeString() }),
+      });
+      const data = await res.json();
+      if (data.ok) setStatus('✓ Restored');
+      else setStatus('Error: ' + (data.error ?? 'unknown'));
+      renderTab();
+    } catch (err) {
+      setStatus('Network error: ' + err.message);
+    }
+  }
+
+  // ── Apply / Revert / Undo / Redo ──────────────────────────────────────
+
+  async function applyEdits(el) {
+    const loc = el.dataset.spoonLoc;
+    const [file, lineStr] = loc.split(':');
+    const line = Number(lineStr);
+    const origClass = state.panel.dataset.origClass ?? '';
+    const origText = state.panel.dataset.origText;
+
+    const patches = [];
+    if (el.className !== origClass) {
+      patches.push({ type: 'class-replace', line, oldValue: origClass, newValue: el.className });
+    }
+    const textInput = state.panel.querySelector('[data-role="text-input"]');
+    if (textInput && origText !== undefined && textInput.value !== origText) {
+      patches.push({ type: 'text', line, oldValue: origText, newValue: textInput.value });
+    }
+    // Also catch inline-edited text changes (when no text-input is in the DOM)
+    if (!textInput && origText !== undefined && el.firstChild?.nodeType === 3 && el.firstChild.textContent !== origText) {
+      patches.push({ type: 'text', line, oldValue: origText, newValue: el.firstChild.textContent });
+    }
+    if (patches.length === 0) { setStatus('Nothing changed.'); return; }
+
+    setStatus('Writing…');
+    try {
+      const res = await fetch(API + '/write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file, patches }),
+      });
+      const data = await res.json();
+      if (data.ok && data.entry) {
+        setStatus('✓ Saved → ' + file);
+        // Local undo stack mirrors the server entry — undo without round-trip noise
+        state.undoStack.push({ el, file, line, entry: data.entry });
+        state.redoStack = [];
+        state.panel.dataset.origClass = el.className;
+        if (textInput) state.panel.dataset.origText = textInput.value;
+        else if (el.firstChild?.nodeType === 3) state.panel.dataset.origText = el.firstChild.textContent;
+      } else if (data.ok) {
+        setStatus('✓ Saved (no-op)');
+      } else {
+        setStatus('Error: ' + (data.error ?? 'unknown'));
+      }
+    } catch (err) {
+      setStatus('Network error: ' + err.message);
+    }
+  }
+
+  function revert() {
+    const el = state.currentEl;
+    if (!el) return;
+    el.className = state.panel.dataset.origClass ?? '';
+    if (state.panel.dataset.origText !== undefined && el.firstChild) {
+      el.firstChild.textContent = state.panel.dataset.origText;
+    }
+    renderTab();
+    setStatus('Reverted unsaved changes.');
+  }
+
+  async function undo() {
+    const item = state.undoStack.pop();
+    if (!item) { setStatus('Nothing to undo.'); return; }
+    setStatus('Undoing…');
+    try {
+      const res = await fetch(API + '/write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file: item.file, patches: item.entry.inverse, label: 'Undo: ' + item.entry.label }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        state.redoStack.push(item);
+        setStatus('↶ Undone');
+        if (state.currentEl) {
+          // Re-sync baseline from DOM so the next apply diffs correctly
+          state.panel.dataset.origClass = state.currentEl.className;
+          if (state.currentEl.firstChild?.nodeType === 3) {
+            state.panel.dataset.origText = state.currentEl.firstChild.textContent;
+          }
+          renderTab();
+        }
+      } else {
+        setStatus('Error: ' + (data.error ?? 'unknown'));
+      }
+    } catch (err) {
+      setStatus('Network error: ' + err.message);
+    }
+  }
+
+  async function redo() {
+    const item = state.redoStack.pop();
+    if (!item) { setStatus('Nothing to redo.'); return; }
+    setStatus('Redoing…');
+    try {
+      const res = await fetch(API + '/write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file: item.file, patches: item.entry.patches, label: 'Redo: ' + item.entry.label }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        state.undoStack.push(item);
+        setStatus('↷ Redone');
+        if (state.currentEl) {
+          state.panel.dataset.origClass = state.currentEl.className;
+          if (state.currentEl.firstChild?.nodeType === 3) {
+            state.panel.dataset.origText = state.currentEl.firstChild.textContent;
+          }
+          renderTab();
+        }
+      } else {
+        setStatus('Error: ' + (data.error ?? 'unknown'));
+      }
+    } catch (err) {
+      setStatus('Network error: ' + err.message);
+    }
+  }
+
+  function setStatus(msg) {
+    const s = state.panel?.querySelector('#__spoon-status');
+    if (s) s.textContent = msg;
   }
 
   // ── UI atoms ──────────────────────────────────────────────────────────
 
   function section(title, accent) {
     const wrap = document.createElement('div');
-    Object.assign(wrap.style, { display: 'flex', flexDirection: 'column', gap: '5px' });
+    Object.assign(wrap.style, { display: 'flex', flexDirection: 'column', gap: '6px' });
     const h = document.createElement('div');
     h.textContent = title;
     Object.assign(h.style, {
@@ -409,6 +1013,33 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     });
     wrap.appendChild(h);
     return wrap;
+  }
+
+  function buttonRow(label, options, onSelect, isActive) {
+    const row = document.createElement('div');
+    Object.assign(row.style, { display: 'flex', alignItems: 'center', gap: '6px' });
+    const lbl = document.createElement('span');
+    lbl.textContent = label;
+    Object.assign(lbl.style, { fontSize: '11px', color: '#a6adc8', width: '50px' });
+    row.appendChild(lbl);
+    const grp = document.createElement('div');
+    Object.assign(grp.style, { display: 'flex', gap: '2px', background: '#11111b', borderRadius: '4px', padding: '2px', flexWrap: 'wrap' });
+    for (const [val, text] of options) {
+      const b = document.createElement('button');
+      b.textContent = text;
+      b.title = val;
+      const active = isActive(val);
+      Object.assign(b.style, {
+        background: active ? '#6366f1' : 'transparent',
+        color: active ? '#fff' : '#a6adc8',
+        border: 'none', borderRadius: '3px', padding: '3px 7px',
+        cursor: 'pointer', fontFamily: 'inherit', fontSize: '11px', minWidth: '24px',
+      });
+      b.onclick = () => onSelect(val);
+      grp.appendChild(b);
+    }
+    row.appendChild(grp);
+    return row;
   }
 
   function chip(text, accent, onRemove) {
@@ -433,39 +1064,35 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     return c;
   }
 
-  function addInput(el, groupId, refresh) {
-    const wrap = document.createElement('input');
-    wrap.type = 'text';
-    wrap.placeholder = '+ add';
-    Object.assign(wrap.style, {
+  function addInput(el, refresh) {
+    const w = document.createElement('input');
+    w.type = 'text';
+    w.placeholder = '+ add';
+    Object.assign(w.style, {
       background: 'transparent', border: '1px dashed #45475a',
       color: '#cdd6f4', borderRadius: '4px', padding: '2px 6px',
-      fontSize: '11px', width: '70px', outline: 'none',
-      fontFamily: 'inherit',
+      fontSize: '11px', width: '80px', outline: 'none', fontFamily: 'inherit',
     });
-    wrap.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && wrap.value.trim()) {
-        addClass(el, wrap.value.trim());
-        wrap.value = '';
+    w.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && w.value.trim()) {
+        addClass(el, w.value.trim());
+        w.value = '';
         refresh();
       }
     });
-    return wrap;
+    return w;
   }
 
   function colorSwatch(token, el, refresh) {
     const btn = document.createElement('button');
     Object.assign(btn.style, {
-      width: '28px', height: '28px', borderRadius: '5px',
+      width: '26px', height: '26px', borderRadius: '5px',
       border: '1px solid #45475a', cursor: 'pointer', padding: '0',
       background: token.preview,
-      position: 'relative',
     });
     btn.title = \`\${token.name} → \${token.preview}\`;
     btn.onclick = () => {
-      // Remove any existing bg-* / text-* and add the token-mapped one
-      const className = el.className.split(/\\s+/).filter((c) => !/^bg-/.test(c)).join(' ');
-      el.className = (className + ' bg-' + token.name).trim();
+      replacePrefixed(el, /^bg-/, 'bg-' + token.name);
       refresh();
     };
     return btn;
@@ -479,85 +1106,19 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       width: '100%', boxSizing: 'border-box',
     };
   }
-
-  function removeClass(el, cls, refresh) {
-    el.className = el.className.split(/\\s+/).filter((c) => c !== cls).join(' ');
-    refresh();
-  }
-  function addClass(el, cls) {
-    const set = new Set(el.className.split(/\\s+/).filter(Boolean));
-    set.add(cls);
-    el.className = Array.from(set).join(' ');
+  function selectStyle() {
+    return {
+      background: '#313244', border: '1px solid #45475a',
+      color: '#cdd6f4', borderRadius: '5px', padding: '4px 6px',
+      fontFamily: 'inherit', fontSize: '11px', outline: 'none',
+    };
   }
 
   function esc(s) {
     return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   }
 
-  // ── Apply (write-back) ────────────────────────────────────────────────
-
-  async function applyEdits(el) {
-    const loc = el.dataset.spoonLoc;
-    const [file, lineStr] = loc.split(':');
-    const line = Number(lineStr);
-    const origClass = panel.dataset.origClass;
-    const origText = panel.dataset.origText;
-
-    const patches = [];
-    if (el.className !== origClass) {
-      patches.push({ type: 'class-replace', line, oldValue: origClass, newValue: el.className });
-    }
-    const textInput = panel.querySelector('[data-role="text-input"]');
-    if (textInput && origText !== undefined && textInput.value !== origText) {
-      patches.push({ type: 'text', line, oldValue: origText, newValue: textInput.value });
-    }
-    if (patches.length === 0) { setStatus('Nothing changed.'); return; }
-
-    setStatus('Writing…');
-    try {
-      const res = await fetch(API + '/write', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file, patches }),
-      });
-      const data = await res.json();
-      if (data.ok) {
-        setStatus('✓ Saved → ' + file);
-        panel.dataset.origClass = el.className;
-        if (textInput) panel.dataset.origText = textInput.value;
-      } else {
-        setStatus('Error: ' + (data.error ?? 'unknown'));
-      }
-    } catch (err) {
-      setStatus('Network error: ' + err.message);
-    }
-  }
-
-  function setStatus(msg) {
-    const s = panel?.querySelector('#__spoon-status');
-    if (s) s.textContent = msg;
-  }
-
-  // ── Toolbar ───────────────────────────────────────────────────────────
-
-  let toolbar = null;
-  function showToolbar() {
-    if (toolbar) return;
-    toolbar = document.createElement('div');
-    Object.assign(toolbar.style, {
-      position: 'fixed', bottom: '16px', right: '16px',
-      background: '#1e1e2e', border: '1px solid #6366f1',
-      borderRadius: '8px', padding: '6px 12px', color: '#6366f1',
-      fontFamily: 'monospace', fontSize: '11px', fontWeight: '600',
-      zIndex: '2147483647', boxShadow: '0 4px 16px rgba(99,102,241,0.3)',
-      pointerEvents: 'none', userSelect: 'none',
-    });
-    toolbar.textContent = '⟡ spoon active — click any element';
-    document.body.appendChild(toolbar);
-  }
-  function hideToolbar() { toolbar?.remove(); toolbar = null; }
-
-  console.log('[spoon] loaded — press ' + HOTKEY + ' to activate visual editor');
+  console.log('[spoon] loaded — press ' + HOTKEY + ' or click the ⟡ pin');
 })();
 `
 }
