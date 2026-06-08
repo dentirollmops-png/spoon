@@ -156,8 +156,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
     // Wire up controls that don't depend on a selection
     panel.querySelector('#__spoon-close').onclick = deactivate;
-    panel.querySelector('#__spoon-revert').onclick = revert;
-    panel.querySelector('#__spoon-apply').onclick = () => state.currentEl && applyEdits(state.currentEl);
+    panel.querySelector('#__spoon-apply').onclick = () => state.currentEl && commit(state.currentEl);
     panel.querySelector('#__spoon-undo').onclick = undo;
     panel.querySelector('#__spoon-redo').onclick = redo;
     panel.querySelectorAll('[data-tab]').forEach((b) => {
@@ -318,11 +317,10 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   }
   function footerHtml() {
     return \`<div style="padding:8px 12px;background:#181825;border-top:1px solid #313244;display:flex;gap:6px;align-items:center;flex-shrink:0;">
-      <button id="__spoon-undo" title="Undo (Cmd+Z)" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:5px 8px;cursor:pointer;font-size:13px">↶</button>
-      <button id="__spoon-redo" title="Redo (Cmd+Shift+Z)" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:5px 8px;cursor:pointer;font-size:13px">↷</button>
-      <div id="__spoon-status" style="flex:1;font-size:11px;color:#a6e3a1;min-height:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
-      <button id="__spoon-revert" style="background:#313244;color:#cdd6f4;border:none;border-radius:5px;padding:6px 10px;cursor:pointer;font-size:12px">Revert</button>
-      <button id="__spoon-apply" style="background:#6366f1;color:#fff;border:none;border-radius:5px;padding:6px 12px;cursor:pointer;font-size:12px;font-weight:600">Apply →</button>
+      <button id="__spoon-undo" title="Undo (Cmd+Z)" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:5px 9px;cursor:pointer;font-size:13px">↶</button>
+      <button id="__spoon-redo" title="Redo (Cmd+Shift+Z)" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:5px 9px;cursor:pointer;font-size:13px">↷</button>
+      <div id="__spoon-status" style="flex:1;font-size:11px;color:#a6e3a1;min-height:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right"></div>
+      <button id="__spoon-apply" title="Force-save now (changes auto-save on edit)" style="background:#6366f1;color:#fff;border:none;border-radius:5px;padding:6px 10px;cursor:pointer;font-size:11px;font-weight:600">Save now</button>
     </div>\`;
   }
 
@@ -416,13 +414,9 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   function selectElement(el) {
     if (!state.panel) mountPanel();
     if (state.currentEl === el) return;
-    if (state.currentEl && state.panel.dataset.origClass !== undefined) {
-      // discard any unsaved tweaks on the previously selected element
-      state.currentEl.className = state.panel.dataset.origClass;
-      if (state.panel.dataset.origText !== undefined && state.currentEl.firstChild) {
-        state.currentEl.firstChild.textContent = state.panel.dataset.origText;
-      }
-    }
+    // Auto-apply mode: changes have already been written. Just rebase
+    // origClass/origText to the current DOM state so the next applyEdits
+    // diffs correctly.
     state.currentEl = el;
     state.panel.dataset.origClass = el.className || '';
     const initialText = el.childNodes.length === 1 && el.firstChild.nodeType === 3
@@ -433,6 +427,18 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     renderBreadcrumb(el);
     setStatus('');
     renderTab();
+  }
+
+  // Auto-commit helpers — every UI action calls these instead of waiting
+  // for an Apply button. commit() is fire-and-forget by design; errors
+  // surface in the footer status line.
+  function commit(el) {
+    applyEdits(el).catch((err) => setStatus('Error: ' + err.message));
+  }
+  let debounceTimer = null;
+  function commitDebounced(el, ms = 400) {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => commit(el), ms);
   }
 
   function showEmptyState() {
@@ -591,6 +597,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     input.dataset.role = 'text-input';
     input.addEventListener('input', () => {
       if (el.firstChild) el.firstChild.textContent = input.value;
+      commitDebounced(el);
     });
     wrap.appendChild(input);
     return wrap;
@@ -610,6 +617,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       ['hidden',       'Hidden'],
     ], (val) => {
       replacePrefixed(el, /^(block|inline-block|inline|flex|inline-flex|grid|inline-grid|hidden|table|contents|flow-root)$/, val);
+      commit(el);
       renderTab();
     }, (val) => classList(el).includes(val));
     wrap.appendChild(displayRow);
@@ -622,7 +630,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
         ['items-end',      '⊥'],
         ['items-stretch',  '↔'],
         ['items-baseline', 'B'],
-      ], (val) => { replacePrefixed(el, /^items-/, val); renderTab(); }, (val) => cur.includes(val)));
+      ], (val) => { replacePrefixed(el, /^items-/, val); commit(el); renderTab(); }, (val) => cur.includes(val)));
 
       wrap.appendChild(buttonRow('Justify', [
         ['justify-start',   '⊢'],
@@ -631,14 +639,14 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
         ['justify-between', '⇔'],
         ['justify-around',  '⊟'],
         ['justify-evenly',  '⊞'],
-      ], (val) => { replacePrefixed(el, /^justify-/, val); renderTab(); }, (val) => cur.includes(val)));
+      ], (val) => { replacePrefixed(el, /^justify-/, val); commit(el); renderTab(); }, (val) => cur.includes(val)));
 
       wrap.appendChild(buttonRow('Direction', [
         ['flex-row',         '→'],
         ['flex-col',         '↓'],
         ['flex-row-reverse', '←'],
         ['flex-col-reverse', '↑'],
-      ], (val) => { replacePrefixed(el, /^flex-(row|col)(-reverse)?$/, val); renderTab(); }, (val) => cur.includes(val)));
+      ], (val) => { replacePrefixed(el, /^flex-(row|col)(-reverse)?$/, val); commit(el); renderTab(); }, (val) => cur.includes(val)));
     }
 
     return wrap;
@@ -686,18 +694,23 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     const update = () => {
       const m = modeSel.value;
       const re = new RegExp('^' + dim + '-');
+      let changed = true;
       if (m === 'auto') { replacePrefixed(el, re, dim + '-auto'); }
       else if (m === 'fill') { replacePrefixed(el, re, dim + '-full'); }
       else if (m === 'preset') {
         const v = valueInput.value.trim();
         if (v) replacePrefixed(el, re, dim + '-' + v);
+        else changed = false;
       } else if (m === 'fixed') {
         const v = valueInput.value.trim();
         if (v) replacePrefixed(el, re, dim + '-[' + v + ']');
+        else changed = false;
       }
+      if (changed) commit(el);
     };
     modeSel.addEventListener('change', update);
     valueInput.addEventListener('change', update);
+    valueInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') update(); });
 
     return row;
   }
@@ -711,7 +724,6 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     Object.assign(hint.style, { fontSize: '10px', color: '#585b70', fontStyle: 'italic' });
     wrap.appendChild(hint);
 
-    // For now, render the existing chip-based editor for spacing classes
     const meta = GROUP_META.spacing;
     const chipRow = document.createElement('div');
     Object.assign(chipRow.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
@@ -719,9 +731,9 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       chipRow.innerHTML = '';
       const groups = parseClasses(el.className);
       for (const cls of groups.spacing) {
-        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); refresh(); }));
+        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); commit(el); refresh(); }));
       }
-      chipRow.appendChild(addInput(el, refresh));
+      chipRow.appendChild(addInput(el, 'spacing', refresh));
     };
     refresh();
     wrap.appendChild(chipRow);
@@ -730,16 +742,21 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
   function chipSection(el, groupId) {
     const meta = GROUP_META[groupId];
-    const wrap = section(meta.label, meta.color);
+    const groups = parseClasses(el.className);
+    const items = groups[groupId];
+    // "Other" / custom is noise when empty — hide it entirely
+    if (groupId === 'other' && items.length === 0) return document.createDocumentFragment();
+
+    const wrap = section(groupId === 'other' ? 'Custom classes' : meta.label, meta.color);
     const chipRow = document.createElement('div');
     Object.assign(chipRow.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
     const refresh = () => {
       chipRow.innerHTML = '';
-      const groups = parseClasses(el.className);
-      for (const cls of groups[groupId]) {
-        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); refresh(); }));
+      const g = parseClasses(el.className);
+      for (const cls of g[groupId]) {
+        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); commit(el); refresh(); }));
       }
-      chipRow.appendChild(addInput(el, refresh));
+      chipRow.appendChild(addInput(el, groupId, refresh));
     };
     refresh();
     wrap.appendChild(chipRow);
@@ -755,22 +772,57 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       chipRow.innerHTML = '';
       const groups = parseClasses(el.className);
       for (const cls of groups.color) {
-        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); refresh(); }));
+        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); commit(el); refresh(); }));
       }
-      chipRow.appendChild(addInput(el, refresh));
+      chipRow.appendChild(addInput(el, 'color', refresh));
     };
     refresh();
     wrap.appendChild(chipRow);
 
     if (state.tokens.colors && state.tokens.colors.length > 0) {
+      // Mode picker: which prefix gets the token? bg- / text- / border-
+      const modeWrap = document.createElement('div');
+      Object.assign(modeWrap.style, { display: 'flex', gap: '4px', alignItems: 'center', marginTop: '8px' });
+      const modeLbl = document.createElement('span');
+      modeLbl.textContent = 'Apply to';
+      Object.assign(modeLbl.style, { fontSize: '10px', color: '#585b70', width: '60px', textTransform: 'uppercase', letterSpacing: '.06em' });
+      modeWrap.appendChild(modeLbl);
+      const modes = ['bg', 'text', 'border', 'ring'];
+      const btns = [];
+      const updateModeBtns = (active) => {
+        btns.forEach((b, i) => {
+          const isActive = modes[i] === active;
+          b.style.background = isActive ? '#6366f1' : 'transparent';
+          b.style.color = isActive ? '#fff' : '#a6adc8';
+        });
+      };
+      const grp = document.createElement('div');
+      Object.assign(grp.style, { display: 'flex', gap: '2px', background: '#11111b', borderRadius: '4px', padding: '2px' });
+      let activeMode = state._colorMode || 'bg';
+      for (const m of modes) {
+        const b = document.createElement('button');
+        b.textContent = m.toUpperCase();
+        Object.assign(b.style, {
+          background: 'transparent', color: '#a6adc8', border: 'none',
+          borderRadius: '3px', padding: '3px 7px', cursor: 'pointer',
+          fontFamily: 'inherit', fontSize: '10px', fontWeight: '600',
+        });
+        b.onclick = () => { activeMode = m; state._colorMode = m; updateModeBtns(m); };
+        btns.push(b);
+        grp.appendChild(b);
+      }
+      updateModeBtns(activeMode);
+      modeWrap.appendChild(grp);
+      wrap.appendChild(modeWrap);
+
       const lbl = document.createElement('div');
-      lbl.textContent = 'Theme tokens — click to set bg-';
+      lbl.textContent = 'Theme tokens — click to apply';
       Object.assign(lbl.style, { fontSize: '10px', color: '#585b70', marginTop: '6px', textTransform: 'uppercase', letterSpacing: '.06em' });
       wrap.appendChild(lbl);
       const swatches = document.createElement('div');
       Object.assign(swatches.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
       for (const tk of state.tokens.colors) {
-        swatches.appendChild(colorSwatch(tk, el, refresh));
+        swatches.appendChild(colorSwatch(tk, el, () => activeMode, refresh));
       }
       wrap.appendChild(swatches);
     }
@@ -784,7 +836,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     const ta = document.createElement('textarea');
     ta.value = el.className;
     Object.assign(ta.style, { ...inputStyle(), minHeight: '80px', resize: 'vertical', fontFamily: 'inherit' });
-    ta.addEventListener('input', () => { el.className = ta.value; });
+    ta.addEventListener('input', () => { el.className = ta.value; commitDebounced(el); });
     cls.appendChild(ta);
     body.appendChild(cls);
 
@@ -795,7 +847,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       input.value = el.firstChild.textContent ?? '';
       input.dataset.role = 'text-input';
       Object.assign(input.style, inputStyle());
-      input.addEventListener('input', () => { el.firstChild.textContent = input.value; });
+      input.addEventListener('input', () => { el.firstChild.textContent = input.value; commitDebounced(el); });
       txt.appendChild(input);
       body.appendChild(txt);
     }
@@ -1064,35 +1116,69 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     return c;
   }
 
-  function addInput(el, refresh) {
+  // Common Tailwind classes per group — drives the +Add datalist
+  // autocomplete. Not exhaustive; the input accepts any value including
+  // arbitrary syntax like shadow-[20px_20px_20px_rgba(0,0,0,0.4)].
+  const SUGGEST = {
+    layout:     ['flex', 'grid', 'block', 'hidden', 'inline-flex', 'absolute', 'relative', 'fixed', 'sticky', 'items-center', 'items-start', 'items-end', 'justify-center', 'justify-between', 'justify-start', 'justify-end', 'flex-col', 'flex-row', 'gap-1', 'gap-2', 'gap-3', 'gap-4', 'gap-6', 'gap-8', 'z-10', 'z-50'],
+    spacing:    ['p-1', 'p-2', 'p-3', 'p-4', 'p-6', 'p-8', 'px-2', 'px-4', 'px-6', 'py-1', 'py-2', 'py-3', 'py-4', 'm-2', 'm-4', 'mx-auto', 'mt-2', 'mt-4', 'mb-2', 'mb-4', 'space-y-2', 'space-y-4', 'space-x-2'],
+    sizing:     ['w-full', 'w-auto', 'w-1/2', 'w-1/3', 'w-2/3', 'w-1/4', 'h-full', 'h-auto', 'h-screen', 'min-h-screen', 'max-w-sm', 'max-w-md', 'max-w-lg', 'max-w-xl', 'max-w-2xl', 'aspect-square', 'aspect-video'],
+    color:      ['bg-white', 'bg-black', 'bg-transparent', 'bg-primary', 'bg-secondary', 'bg-muted', 'bg-accent', 'text-white', 'text-black', 'text-primary', 'text-muted-foreground', 'border-border', 'border-primary'],
+    typography: ['text-xs', 'text-sm', 'text-base', 'text-lg', 'text-xl', 'text-2xl', 'text-3xl', 'font-light', 'font-normal', 'font-medium', 'font-semibold', 'font-bold', 'text-center', 'text-left', 'text-right', 'leading-tight', 'leading-relaxed', 'tracking-tight', 'tracking-wide', 'truncate', 'italic', 'uppercase'],
+    effects:    ['rounded', 'rounded-md', 'rounded-lg', 'rounded-xl', 'rounded-full', 'shadow', 'shadow-sm', 'shadow-md', 'shadow-lg', 'shadow-xl', 'shadow-2xl', 'shadow-none', 'opacity-0', 'opacity-50', 'opacity-75', 'cursor-pointer', 'transition', 'transition-all', 'duration-150', 'duration-300', 'hover:opacity-90', 'animate-pulse', 'animate-spin', 'border', 'border-2'],
+    other:      [],
+  };
+
+  function addInput(el, groupId, refresh) {
+    const wrap = document.createElement('span');
+    Object.assign(wrap.style, { display: 'inline-flex', alignItems: 'center' });
     const w = document.createElement('input');
     w.type = 'text';
-    w.placeholder = '+ add';
+    w.placeholder = '+ add class';
+    w.title = 'Enter a Tailwind class. Arbitrary values work too, e.g. shadow-[0_2px_10px_rgba(0,0,0,0.3)]';
     Object.assign(w.style, {
       background: 'transparent', border: '1px dashed #45475a',
       color: '#cdd6f4', borderRadius: '4px', padding: '2px 6px',
-      fontSize: '11px', width: '80px', outline: 'none', fontFamily: 'inherit',
+      fontSize: '11px', width: '110px', outline: 'none', fontFamily: 'inherit',
     });
+    // Native datalist autocomplete — no extra deps, keyboard-friendly
+    const listId = '__spoon-sug-' + groupId;
+    w.setAttribute('list', listId);
+    let dl = document.getElementById(listId);
+    if (!dl) {
+      dl = document.createElement('datalist');
+      dl.id = listId;
+      for (const s of (SUGGEST[groupId] || [])) {
+        const o = document.createElement('option');
+        o.value = s;
+        dl.appendChild(o);
+      }
+      document.body.appendChild(dl);
+    }
     w.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && w.value.trim()) {
         addClass(el, w.value.trim());
         w.value = '';
+        commit(el);
         refresh();
       }
     });
-    return w;
+    wrap.appendChild(w);
+    return wrap;
   }
 
-  function colorSwatch(token, el, refresh) {
+  function colorSwatch(token, el, getMode, refresh) {
     const btn = document.createElement('button');
     Object.assign(btn.style, {
       width: '26px', height: '26px', borderRadius: '5px',
       border: '1px solid #45475a', cursor: 'pointer', padding: '0',
       background: token.preview,
     });
-    btn.title = \`\${token.name} → \${token.preview}\`;
+    btn.title = \`\${token.name} → \${token.preview} (click to apply with current prefix)\`;
     btn.onclick = () => {
-      replacePrefixed(el, /^bg-/, 'bg-' + token.name);
+      const mode = typeof getMode === 'function' ? getMode() : 'bg';
+      replacePrefixed(el, new RegExp('^' + mode + '-'), mode + '-' + token.name);
+      commit(el);
       refresh();
     };
     return btn;
