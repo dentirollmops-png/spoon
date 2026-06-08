@@ -1075,19 +1075,18 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
       // When the color comes from a custom CSS class or gradient, a Tailwind
       // bg- class can't override it. Offer to edit the source class instead.
-      if ((customColorClass || hasGradient) && !activeClass && !inlineVal) {
-        const edit = document.createElement('button');
-        edit.textContent = '✎ edit class';
-        edit.title = 'This color is defined by a custom CSS class' + (customColorClass ? ' (.' + customColorClass + ')' : '') + '. Open it in your CSS to change the gradient/color. Tailwind utilities can\\'t override it.';
-        Object.assign(edit.style, { marginLeft: 'auto', background: '#313244', color: '#f9e2af', border: 'none', borderRadius: '4px', padding: '3px 8px', cursor: 'pointer', fontSize: '10px', fontFamily: 'inherit', flexShrink: '0' });
-        edit.onclick = () => setStatus('Color set by CSS class' + (customColorClass ? ' .' + customColorClass : '') + ' — edit it in your stylesheet (e.g. index.css).');
-        readout.appendChild(edit);
-      } else if (inlineVal && !activeClass) {
-        const warn = document.createElement('div');
-        warn.textContent = '⚠ inline';
-        warn.title = 'This element sets ' + activeMode + ' via an inline style attribute, which overrides Tailwind classes. Edit the style prop in source, or remove it first.';
-        Object.assign(warn.style, { marginLeft: 'auto', color: '#f9e2af', fontSize: '10px', cursor: 'help', flexShrink: '0' });
-        readout.appendChild(warn);
+      // When the color is owned by an inline style, a gradient, or a custom
+      // CSS class, a Tailwind utility can't override it — so we write the
+      // inline style prop instead. The CSS property name for each mode:
+      const styleProp = { bg: 'background', text: 'color', border: 'border-color', ring: 'outline-color' }[activeMode];
+      const needsInline = !!(inlineVal || hasGradient || (customColorClass && activeMode === 'bg'));
+
+      if (needsInline) {
+        const badge = document.createElement('div');
+        badge.textContent = '⚠ inline';
+        badge.title = 'This color comes from ' + (hasGradient ? 'a gradient' : inlineVal ? 'an inline style' : 'a custom CSS class .' + customColorClass) + ', which Tailwind classes can\\'t override. The picker below writes the inline style prop directly.';
+        Object.assign(badge.style, { marginLeft: 'auto', color: '#f9e2af', fontSize: '10px', cursor: 'help', flexShrink: '0' });
+        readout.appendChild(badge);
       }
 
       // picker
@@ -1097,13 +1096,18 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       picker.value = rgbToHex(computed);
       Object.assign(picker.style, { width: '36px', height: '28px', border: '1px solid #45475a', borderRadius: '5px', background: '#181825', cursor: 'pointer', padding: '2px' });
       picker.addEventListener('change', () => {
-        replacePrefixed(el, colorRe, activeMode + '-[' + picker.value + ']');
-        commit(el);
-        setTimeout(rerender, 120);
+        if (needsInline) {
+          // Overrides gradient/inline/custom-class by writing the style prop.
+          writeStyleProp(el, styleProp, picker.value);
+        } else {
+          replacePrefixed(el, colorRe, activeMode + '-[' + picker.value + ']');
+          commit(el);
+        }
+        setTimeout(rerender, 150);
       });
       pickerRow.appendChild(picker);
       const pickerLbl = document.createElement('span');
-      pickerLbl.textContent = 'Custom ' + activeMode + ' color';
+      pickerLbl.textContent = needsInline ? 'Set ' + activeMode + ' (inline)' : 'Custom ' + activeMode + ' color';
       Object.assign(pickerLbl.style, { fontSize: '11px', color: '#a6adc8' });
       pickerRow.appendChild(pickerLbl);
       if (activeClass) {
@@ -1111,6 +1115,13 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
         clr.textContent = 'clear';
         Object.assign(clr.style, { marginLeft: 'auto', background: '#313244', color: '#cdd6f4', border: 'none', borderRadius: '4px', padding: '3px 8px', cursor: 'pointer', fontSize: '10px', fontFamily: 'inherit' });
         clr.onclick = () => { replacePrefixed(el, colorRe, ''); commit(el); setTimeout(rerender, 120); };
+        pickerRow.appendChild(clr);
+      } else if (inlineVal) {
+        const clr = document.createElement('button');
+        clr.textContent = 'clear inline';
+        clr.title = 'Remove the inline ' + styleProp + ' so Tailwind classes can take effect again';
+        Object.assign(clr.style, { marginLeft: 'auto', background: '#313244', color: '#cdd6f4', border: 'none', borderRadius: '4px', padding: '3px 8px', cursor: 'pointer', fontSize: '10px', fontFamily: 'inherit' });
+        clr.onclick = () => { writeStyleProp(el, styleProp, ''); setTimeout(rerender, 150); };
         pickerRow.appendChild(clr);
       }
 
@@ -1127,9 +1138,14 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
           const tokenClass = activeMode + '-' + tk.name;
           const isActive = activeClass === tokenClass;
           swatches.appendChild(colorSwatch(tk, isActive, () => {
-            replacePrefixed(el, colorRe, tokenClass);
-            commit(el);
-            setTimeout(rerender, 120);
+            if (needsInline) {
+              // Use the CSS-var so it tracks theme/dark-mode, not the resolved hex.
+              writeStyleProp(el, styleProp, 'hsl(var(--' + tk.varName + '))');
+            } else {
+              replacePrefixed(el, colorRe, tokenClass);
+              commit(el);
+            }
+            setTimeout(rerender, 150);
           }));
         }
         tokWrap.appendChild(swatches);
@@ -1260,6 +1276,31 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       body: JSON.stringify({ file, loc, op, label }),
     });
     return res.json();
+  }
+
+  // Write a single inline style property straight to the JSX style={{...}}.
+  // Used when a color comes from an inline style/gradient that no class can
+  // override. Applies optimistically to the DOM, then persists.
+  async function writeStyleProp(el, prop, value) {
+    const { file, loc } = parseLoc(el.dataset.spoonLoc);
+    // optimistic DOM update so the preview reflects immediately
+    if (value === '') el.style.removeProperty(prop);
+    else el.style.setProperty(prop, value);
+    setStatus('Saving…');
+    try {
+      const data = await writeOp(file, loc, { style: { prop, value } });
+      if (data.ok && data.entry) {
+        setStatus('✓ Saved style.' + prop);
+        state.undoStack.push(data.entry);
+        state.redoStack = [];
+      } else if (data.ok) {
+        setStatus('No change needed.');
+      } else {
+        setStatus('⚠ ' + (data.error ?? 'could not edit style'));
+      }
+    } catch (err) {
+      setStatus('Network error: ' + err.message);
+    }
   }
 
   async function applyEdits(el) {

@@ -9,6 +9,13 @@ export interface EditOp {
   className?: string
   /** Set/replace the single text child of the element. */
   text?: string
+  /**
+   * Set/replace a single inline style property, e.g. { prop: 'background',
+   * value: '#fff' }. value:'' removes the property. Only works on static
+   * object-literal style props (style={{ ... }}); dynamic expressions are
+   * rejected with a helpful error.
+   */
+  style?: { prop: string; value: string }
 }
 
 export interface WriteResult {
@@ -18,6 +25,8 @@ export interface WriteResult {
   /** What the className was before, so the caller can build an inverse op. */
   prevClassName?: string
   prevText?: string
+  /** Previous value of the edited style prop (for inverse ops). */
+  prevStyle?: { prop: string; value: string }
 }
 
 /**
@@ -69,6 +78,7 @@ export function applyEditAtLocation(
   const edits: { start: number; end: number; replacement: string }[] = []
   let prevClassName: string | undefined
   let prevText: string | undefined
+  let prevStyle: { prop: string; value: string } | undefined
 
   if (op.className !== undefined) {
     const r = classNameEdit(openingNode, op.className)
@@ -84,8 +94,15 @@ export function applyEditAtLocation(
     prevText = r.prev
   }
 
+  if (op.style !== undefined) {
+    const r = styleEdit(openingNode, op.style.prop, op.style.value)
+    if (r.error) return { ok: false, error: r.error }
+    if (r.edit) edits.push(r.edit)
+    prevStyle = { prop: op.style.prop, value: r.prev ?? '' }
+  }
+
   if (edits.length === 0) {
-    return { ok: true, code: source, prevClassName, prevText }
+    return { ok: true, code: source, prevClassName, prevText, prevStyle }
   }
 
   edits.sort((a, b) => b.start - a.start)
@@ -94,7 +111,71 @@ export function applyEditAtLocation(
     code = code.slice(0, e.start) + e.replacement + code.slice(e.end)
   }
 
-  return { ok: true, code, prevClassName, prevText }
+  return { ok: true, code, prevClassName, prevText, prevStyle }
+}
+
+/**
+ * Edit a single property inside a static style={{ ... }} object literal.
+ * Handles three cases: property exists (replace its value), property absent
+ * (insert it), or no style prop at all (add style={{ prop: 'value' }}).
+ * Dynamic style values (style={expr} or a conditional property value) are
+ * rejected — we won't guess what a ternary should become.
+ */
+function styleEdit(
+  opening: t.JSXOpeningElement,
+  prop: string,
+  value: string,
+): { edit?: { start: number; end: number; replacement: string }; prev?: string; error?: string } {
+  const camel = prop.replace(/-([a-z])/g, (_, c) => c.toUpperCase())
+
+  const attr = opening.attributes.find(
+    (a): a is t.JSXAttribute =>
+      t.isJSXAttribute(a) && t.isJSXIdentifier(a.name) && a.name.name === 'style',
+  )
+
+  // No style prop yet — add style={{ prop: "value" }} after the tag name.
+  if (!attr) {
+    if (value === '') return { prev: '' }
+    const nameEnd = opening.name.end
+    if (nameEnd == null) return { error: 'cannot locate tag name end' }
+    return {
+      edit: { start: nameEnd, end: nameEnd, replacement: ` style={{ ${camel}: ${JSON.stringify(value)} }}` },
+      prev: '',
+    }
+  }
+
+  // style must be style={{ ...objectLiteral }}
+  if (!t.isJSXExpressionContainer(attr.value) || !t.isObjectExpression(attr.value.expression)) {
+    return { error: 'style is not a static object literal — edit it in source' }
+  }
+  const obj = attr.value.expression
+
+  // Find the matching property (by camelCase identifier or string key)
+  const existing = obj.properties.find((p): p is t.ObjectProperty => {
+    if (!t.isObjectProperty(p)) return false
+    if (t.isIdentifier(p.key)) return p.key.name === camel
+    if (t.isStringLiteral(p.key)) return p.key.value === prop || p.key.value === camel
+    return false
+  })
+
+  if (existing) {
+    const v = existing.value
+    if (t.isStringLiteral(v)) {
+      if (v.start == null || v.end == null) return { error: 'no range on style value' }
+      return { edit: { start: v.start, end: v.end, replacement: JSON.stringify(value) }, prev: v.value }
+    }
+    // Dynamic value (ternary, template, member) — don't clobber app logic.
+    return { error: `${prop} is set by a dynamic expression — edit it in source` }
+  }
+
+  // Property not present — insert it at the start of the object.
+  if (value === '') return { prev: '' }
+  if (obj.start == null) return { error: 'no range on style object' }
+  const insertAt = obj.start + 1 // just after the opening {
+  return {
+    edit: { start: insertAt, end: insertAt, replacement: ` ${camel}: ${JSON.stringify(value)},` },
+    prev: '',
+  }
 }
 
 function classNameEdit(

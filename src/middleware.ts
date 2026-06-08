@@ -82,6 +82,9 @@ export function createMiddleware(opts: ResolvedSpoonOptions): Handler {
         const inverse: EditOp = {}
         if (op.className !== undefined) inverse.className = result.prevClassName ?? ''
         if (op.text !== undefined) inverse.text = result.prevText ?? ''
+        if (op.style !== undefined) {
+          inverse.style = { prop: op.style.prop, value: result.prevStyle?.value ?? '' }
+        }
 
         const entry: HistoryEntry = {
           id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
@@ -173,10 +176,11 @@ interface HistoryEntry {
 }
 
 function summariseLabel(op: EditOp): string {
-  if (op.className !== undefined && op.text !== undefined) return 'Edit class + text'
-  if (op.className !== undefined) return 'Edit classes'
-  if (op.text !== undefined) return 'Edit text'
-  return 'edit'
+  const parts: string[] = []
+  if (op.className !== undefined) parts.push('classes')
+  if (op.text !== undefined) parts.push('text')
+  if (op.style !== undefined) parts.push('style.' + op.style.prop)
+  return parts.length ? 'Edit ' + parts.join(' + ') : 'edit'
 }
 
 // ── History persistence ─────────────────────────────────────────────────
