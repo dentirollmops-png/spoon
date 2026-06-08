@@ -22,6 +22,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   // ── State ─────────────────────────────────────────────────────────────
   const state = {
     active: false,
+    root: null,
     panel: null,
     pin: null,
     currentEl: null,
@@ -75,6 +76,52 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     }
   });
 
+  // ── Spoon root & body-squeeze ─────────────────────────────────────────
+  // Spoon's own UI lives in a container on <html>, NOT <body>. This keeps
+  // it above everything (including the app's fixed modals) and immune to
+  // the squeeze we apply to <body>.
+  function ensureRoot() {
+    if (state.root && document.documentElement.contains(state.root)) return state.root;
+    const root = document.createElement('div');
+    root.id = '__spoon-root';
+    // The container itself is inert; children opt back into pointer events.
+    Object.assign(root.style, { position: 'fixed', inset: '0', zIndex: '2147483646', pointerEvents: 'none' });
+    document.documentElement.appendChild(root);
+    state.root = root;
+    return root;
+  }
+
+  // Squeeze the app to make room for the panel. Applying a transform to
+  // <body> turns it into the containing block for ALL its fixed-positioned
+  // descendants — so the app's own fixed buttons/modals now resolve their
+  // top/right/inset against the squeezed body box instead of the viewport.
+  // That's what keeps them out from under the panel.
+  function squeezeBody(pos, size, animate = true) {
+    const b = document.body.style;
+    b.transition = animate ? 'width 0.15s ease, height 0.15s ease' : 'none';
+    b.transform = 'translateZ(0)';
+    b.transformOrigin = 'top left';
+    if (pos === 'right') {
+      b.width = 'calc(100% - ' + size + 'px)';
+      b.height = '';
+      b.minHeight = '100vh';
+      b.overflowX = 'hidden';
+    } else if (pos === 'bottom') {
+      b.width = '';
+      b.height = 'calc(100vh - ' + size + 'px)';
+      b.minHeight = '0';
+      b.overflowY = 'auto';
+    } else {
+      unsqueezeBody();
+    }
+  }
+  function unsqueezeBody() {
+    const b = document.body.style;
+    b.width = ''; b.height = ''; b.minHeight = '';
+    b.transform = ''; b.transformOrigin = '';
+    b.overflowX = ''; b.overflowY = '';
+  }
+
   // ── Lifecycle ─────────────────────────────────────────────────────────
 
   async function activate() {
@@ -121,8 +168,9 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     });
     pin.textContent = '⟡ spoon';
     pin.title = 'Open spoon visual editor (' + HOTKEY + ')';
+    pin.style.pointerEvents = 'auto';
     pin.onclick = () => activate();
-    document.body.appendChild(pin);
+    ensureRoot().appendChild(pin);
     state.pin = pin;
   }
   function hidePin() { state.pin?.remove(); state.pin = null; }
@@ -144,6 +192,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       fontSize: '12px', zIndex: '2147483647',
       display: 'flex', flexDirection: 'column',
       border: '1px solid #313244',
+      pointerEvents: 'auto',
     });
     panel.innerHTML =
       headerHtml() +
@@ -151,7 +200,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       '<div id="__spoon-body" style="overflow:auto;flex:1;padding:12px 14px;display:flex;flex-direction:column;gap:14px;"></div>' +
       footerHtml();
 
-    document.body.appendChild(panel);
+    ensureRoot().appendChild(panel);
     state.panel = panel;
 
     // Wire up controls that don't depend on a selection
@@ -173,8 +222,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   function unmountPanel() {
     state.panel?.remove();
     state.panel = null;
-    document.body.style.marginRight = '';
-    document.body.style.marginBottom = '';
+    unsqueezeBody();
   }
 
   function applyPosition(pos) {
@@ -188,21 +236,17 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       width: '', height: '', borderRadius: '0',
       transform: '',
     });
-    document.body.style.marginRight = '';
-    document.body.style.marginBottom = '';
 
     // remove old grip
     p.querySelector('#__spoon-grip')?.remove();
 
     if (pos === 'right') {
       Object.assign(p.style, { top: '0', right: '0', height: '100vh', width: state.panelWidth + 'px' });
-      document.body.style.transition = 'margin 0.15s ease';
-      document.body.style.marginRight = state.panelWidth + 'px';
+      squeezeBody('right', state.panelWidth);
       addGrip(p, 'ew');
     } else if (pos === 'bottom') {
       Object.assign(p.style, { bottom: '0', left: '0', width: '100vw', height: state.panelHeight + 'px' });
-      document.body.style.transition = 'margin 0.15s ease';
-      document.body.style.marginBottom = state.panelHeight + 'px';
+      squeezeBody('bottom', state.panelHeight);
       addGrip(p, 'ns');
     } else if (pos === 'floating') {
       Object.assign(p.style, {
@@ -210,6 +254,8 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
         width: state.panelWidth + 'px', height: '60vh',
         borderRadius: '10px',
       });
+      // Floating doesn't squeeze — it overlaps; user positions it freely.
+      unsqueezeBody();
       makeFloatable(p);
     }
     // highlight active position button
@@ -245,12 +291,12 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
         const next = Math.max(280, Math.min(720, startW + (start - ev.clientX)));
         state.panelWidth = next;
         state.panel.style.width = next + 'px';
-        document.body.style.marginRight = next + 'px';
+        squeezeBody('right', next, false); // no transition while dragging
       } else {
         const next = Math.max(180, Math.min(window.innerHeight - 100, startH + (start - ev.clientY)));
         state.panelHeight = next;
         state.panel.style.height = next + 'px';
-        document.body.style.marginBottom = next + 'px';
+        squeezeBody('bottom', next, false);
       }
     };
     const onUp = () => {
@@ -903,6 +949,26 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   // Which CSS property does each color mode read/affect?
   const COLOR_MODE_CSS = { bg: 'backgroundColor', text: 'color', border: 'borderColor', ring: 'outlineColor' };
 
+  // Tailwind-shaped class? (rough: known prefixes or arbitrary [..] values)
+  const TW_SHAPE = /^(-?(p|m|w|h|gap|space|text|bg|border|ring|rounded|flex|grid|items|justify|font|leading|tracking|shadow|opacity|z|inset|top|right|bottom|left|col|row|order|object|overflow|cursor|transition|duration|ease|animate|translate|rotate|scale|min|max|aspect|self|place|basis|grow|shrink|divide|from|via|to|fill|stroke|backdrop|blur|brightness)([-\\[]|$))|^(block|inline|inline-block|inline-flex|hidden|absolute|relative|fixed|sticky|static|truncate|italic|uppercase|lowercase|capitalize|underline|container|antialiased)$/;
+
+  // Find a custom (non-Tailwind) class that actually contributes the element's
+  // background color or gradient — by temporarily removing each candidate and
+  // checking whether the computed background changes.
+  function findCustomBgClass(el) {
+    const before = getComputedStyle(el);
+    const beforeKey = before.backgroundColor + '|' + before.backgroundImage;
+    const candidates = classList(el).filter((c) => !TW_SHAPE.test(c));
+    for (const c of candidates) {
+      el.classList.remove(c);
+      const after = getComputedStyle(el);
+      const afterKey = after.backgroundColor + '|' + after.backgroundImage;
+      el.classList.add(c);
+      if (afterKey !== beforeKey) return c;
+    }
+    return null;
+  }
+
   function colorSection(el) {
     const meta = GROUP_META.color;
     const wrap = section(meta.label, meta.color);
@@ -967,32 +1033,60 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       });
 
       const cssProp = COLOR_MODE_CSS[activeMode];
-      const computed = getComputedStyle(el)[cssProp];
+      const cs = getComputedStyle(el);
+      const computed = cs[cssProp];
+      // Gradients/images live in background-image, not background-color.
+      const bgImage = cs.backgroundImage;
+      const hasGradient = activeMode === 'bg' && bgImage && bgImage !== 'none' && /gradient/.test(bgImage);
+
       // Detect the source of the current color
       const colorRe = activeMode === 'text' ? TEXT_COLOR_RE : new RegExp('^' + activeMode + '-');
       const activeClass = classList(el).find((c) => colorRe.test(c));
       const inlineStyleProp = { bg: 'background', text: 'color', border: 'borderColor', ring: 'outlineColor' };
       const inlineVal = el.style[inlineStyleProp[activeMode]] || (activeMode === 'bg' && el.style.backgroundColor);
-      let source = activeClass ? 'class: ' + activeClass : inlineVal ? 'inline style' : 'inherited / CSS';
+
+      // Find a non-Tailwind (custom) class that owns this background — e.g.
+      // .btn-primary setting a gradient.
+      const customColorClass = activeMode === 'bg' ? findCustomBgClass(el) : null;
+
+      let source;
+      if (activeClass) source = 'class: ' + activeClass;
+      else if (hasGradient && customColorClass) source = 'gradient via .' + customColorClass;
+      else if (hasGradient) source = 'gradient (CSS)';
+      else if (inlineVal) source = 'inline style';
+      else if (customColorClass) source = 'CSS class .' + customColorClass;
+      else source = 'inherited / CSS';
 
       // readout
       readout.innerHTML = '';
       const sw = document.createElement('div');
-      Object.assign(sw.style, { width: '28px', height: '28px', borderRadius: '5px', border: '1px solid #45475a', background: computed, flexShrink: '0' });
+      Object.assign(sw.style, {
+        width: '28px', height: '28px', borderRadius: '5px',
+        border: '1px solid #45475a', flexShrink: '0',
+        background: hasGradient ? bgImage : computed,
+      });
       readout.appendChild(sw);
       const info = document.createElement('div');
-      Object.assign(info.style, { display: 'flex', flexDirection: 'column', gap: '1px', overflow: 'hidden' });
+      Object.assign(info.style, { display: 'flex', flexDirection: 'column', gap: '1px', overflow: 'hidden', flex: '1' });
       info.innerHTML =
-        '<span style="color:#cdd6f4;font-size:11px">' + esc(computed) + '</span>' +
+        '<span style="color:#cdd6f4;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(hasGradient ? 'gradient' : computed) + '</span>' +
         '<span style="color:#6c7086;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(source) + '</span>';
       readout.appendChild(info);
 
-      // Warn when an inline style will win over any class we set
-      if (inlineVal && !activeClass) {
+      // When the color comes from a custom CSS class or gradient, a Tailwind
+      // bg- class can't override it. Offer to edit the source class instead.
+      if ((customColorClass || hasGradient) && !activeClass && !inlineVal) {
+        const edit = document.createElement('button');
+        edit.textContent = '✎ edit class';
+        edit.title = 'This color is defined by a custom CSS class' + (customColorClass ? ' (.' + customColorClass + ')' : '') + '. Open it in your CSS to change the gradient/color. Tailwind utilities can\\'t override it.';
+        Object.assign(edit.style, { marginLeft: 'auto', background: '#313244', color: '#f9e2af', border: 'none', borderRadius: '4px', padding: '3px 8px', cursor: 'pointer', fontSize: '10px', fontFamily: 'inherit', flexShrink: '0' });
+        edit.onclick = () => setStatus('Color set by CSS class' + (customColorClass ? ' .' + customColorClass : '') + ' — edit it in your stylesheet (e.g. index.css).');
+        readout.appendChild(edit);
+      } else if (inlineVal && !activeClass) {
         const warn = document.createElement('div');
         warn.textContent = '⚠ inline';
         warn.title = 'This element sets ' + activeMode + ' via an inline style attribute, which overrides Tailwind classes. Edit the style prop in source, or remove it first.';
-        Object.assign(warn.style, { marginLeft: 'auto', color: '#f9e2af', fontSize: '10px', cursor: 'help' });
+        Object.assign(warn.style, { marginLeft: 'auto', color: '#f9e2af', fontSize: '10px', cursor: 'help', flexShrink: '0' });
         readout.appendChild(warn);
       }
 
@@ -1363,7 +1457,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
         o.value = s;
         dl.appendChild(o);
       }
-      document.body.appendChild(dl);
+      ensureRoot().appendChild(dl);
     }
     w.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && w.value.trim()) {
