@@ -193,11 +193,13 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       display: 'flex', flexDirection: 'column',
       border: '1px solid #313244',
       pointerEvents: 'auto',
+      overflow: 'hidden', // body scrolls internally; panel clips to its box
+      boxSizing: 'border-box',
     });
     panel.innerHTML =
       headerHtml() +
       tabBarHtml() +
-      '<div id="__spoon-body" style="overflow:auto;flex:1;padding:12px 14px;display:flex;flex-direction:column;gap:14px;"></div>' +
+      '<div id="__spoon-body" style="overflow-y:auto;overflow-x:hidden;flex:1 1 0;min-height:0;padding:12px 14px;display:flex;flex-direction:column;gap:14px;"></div>' +
       footerHtml();
 
     ensureRoot().appendChild(panel);
