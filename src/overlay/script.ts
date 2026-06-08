@@ -364,11 +364,14 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     return \`<button data-tab="\${id}" style="flex:1;background:transparent;border:none;color:#a6adc8;padding:7px 8px;cursor:pointer;font-family:inherit;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid transparent">\${label}</button>\`;
   }
   function footerHtml() {
-    return \`<div style="padding:8px 12px;background:#181825;border-top:1px solid #313244;display:flex;gap:6px;align-items:center;flex-shrink:0;">
-      <button id="__spoon-undo" title="Undo (Cmd+Z)" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:5px 9px;cursor:pointer;font-size:13px">↶</button>
-      <button id="__spoon-redo" title="Redo (Cmd+Shift+Z)" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:5px 9px;cursor:pointer;font-size:13px">↷</button>
-      <div id="__spoon-status" style="flex:1;font-size:11px;color:#a6e3a1;min-height:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right"></div>
-      <button id="__spoon-apply" title="Force-save now (changes auto-save on edit)" style="background:#6366f1;color:#fff;border:none;border-radius:5px;padding:6px 10px;cursor:pointer;font-size:11px;font-weight:600">Save now</button>
+    return \`<div style="flex-shrink:0;">
+      <div id="__spoon-status" style="display:none;padding:8px 12px;background:#181825;border-top:1px solid #313244;font-size:11px;line-height:1.4;color:#a6e3a1;white-space:normal;word-break:break-word;"></div>
+      <div style="padding:8px 12px;background:#181825;border-top:1px solid #313244;display:flex;gap:6px;align-items:center;">
+        <button id="__spoon-undo" title="Undo (Cmd+Z)" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:5px 9px;cursor:pointer;font-size:13px">↶</button>
+        <button id="__spoon-redo" title="Redo (Cmd+Shift+Z)" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:5px 9px;cursor:pointer;font-size:13px">↷</button>
+        <div style="flex:1"></div>
+        <button id="__spoon-apply" title="Force-save now (changes auto-save on edit)" style="background:#6366f1;color:#fff;border:none;border-radius:5px;padding:6px 10px;cursor:pointer;font-size:11px;font-weight:600">Save now</button>
+      </div>
     </div>\`;
   }
 
@@ -1449,9 +1452,20 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     renderTab();
   }
 
+  let statusTimer = null;
   function setStatus(msg) {
     const s = state.panel?.querySelector('#__spoon-status');
-    if (s) s.textContent = msg;
+    if (!s) return;
+    clearTimeout(statusTimer);
+    if (!msg) { s.style.display = 'none'; s.textContent = ''; return; }
+    s.textContent = msg;
+    s.style.display = 'block';
+    // Warnings/errors stay; transient success messages auto-hide.
+    const isWarn = /^[⚠✗]|error|could not|dynamic|unchanged/i.test(msg);
+    s.style.color = isWarn ? '#f9e2af' : '#a6e3a1';
+    if (!isWarn) {
+      statusTimer = setTimeout(() => { s.style.display = 'none'; s.textContent = ''; }, 4000);
+    }
   }
 
   // ── UI atoms ──────────────────────────────────────────────────────────
