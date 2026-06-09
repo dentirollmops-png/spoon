@@ -1257,7 +1257,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     const { file, loc: srcLoc } = parseLoc(loc);
 
     out.textContent = '';
-    appendOut(out, '✦ Starting Claude (' + model + ')…\n', '#6366f1');
+    appendOut(out, '✦ Starting Claude (' + model + ')…\\n', '#6366f1');
     runBtn.disabled = true;
     runBtn.textContent = '… running';
     runBtn.style.opacity = '0.6';
