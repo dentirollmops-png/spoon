@@ -1258,7 +1258,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     }
 
     runBtn.onclick = () => {
-      if (state.task && state.task.running) { setStatus('A task is already running.'); return; }
+      if (state.task && state.task.running) { stopClaudeTask(); return; }
       runClaudeTask(el, ta.value.trim(), modelSel.value);
     };
 
@@ -1266,18 +1266,30 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   }
 
   // Reflect running/idle state on the run button (called from the ticker too).
+  // While running, the button becomes a Stop control.
   function syncRunBtn() {
     const btn = state.panel?.querySelector('#__spoon-task-run');
     if (!btn) return;
     if (state.task && state.task.running) {
       const secs = Math.floor((Date.now() - state.task.startedAt) / 1000);
-      btn.textContent = '… running ' + secs + 's';
-      btn.style.opacity = '0.6';
-      btn.disabled = true;
-    } else {
-      btn.textContent = '▶ Run';
+      btn.textContent = '■ Stop (' + secs + 's)';
+      btn.style.background = '#f38ba8';
+      btn.style.color = '#1e1e2e';
       btn.style.opacity = '1';
       btn.disabled = false;
+    } else {
+      btn.textContent = '▶ Run';
+      btn.style.background = '#6366f1';
+      btn.style.color = '#fff';
+      btn.style.opacity = '1';
+      btn.disabled = false;
+    }
+  }
+
+  function stopClaudeTask() {
+    if (state.task && state.task._abort) {
+      state.task._abort.abort();
+      taskLog('\\n■ Stopped by user.\\n', '#f38ba8');
     }
   }
 
@@ -1303,8 +1315,9 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     const loc = el.dataset.spoonLoc;
     const { file, loc: srcLoc } = parseLoc(loc);
 
-    // Fresh task state
-    state.task = { running: true, lines: [], startedAt: Date.now(), instruction, done: false };
+    // Fresh task state (with an abort controller so Stop can cancel the stream)
+    const abort = new AbortController();
+    state.task = { running: true, lines: [], startedAt: Date.now(), instruction, done: false, _abort: abort };
     taskLog('✦ Starting Claude (' + model + ')…\\n', '#6366f1');
 
     // Global ticker keeps the run button live even across tab switches.
@@ -1316,6 +1329,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       const res = await fetch(API + '/task', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: abort.signal,
         body: JSON.stringify({
           instruction, file, line: srcLoc.line, loc,
           html: el.outerHTML.slice(0, 1500), model,
@@ -1342,7 +1356,8 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       taskLog('\\n✓ Done in ' + took + 's — HMR will reload changes.\\n', '#a6e3a1');
       setStatus('✓ Claude task done. Revert via History if needed.');
     } catch (err) {
-      taskLog('\\nError: ' + err.message + '\\n', '#f38ba8');
+      // AbortError = user pressed Stop; already logged, not a failure.
+      if (err.name !== 'AbortError') taskLog('\\nError: ' + err.message + '\\n', '#f38ba8');
     } finally {
       if (state.task) { state.task.running = false; state.task.done = true; }
       clearInterval(taskTicker);

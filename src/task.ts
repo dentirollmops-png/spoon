@@ -109,6 +109,11 @@ export function runTask(req: TaskRequest, res: ServerResponse): void {
     child = spawn(bin, args, {
       cwd: cwd(),
       env: childEnv,
+      // CRITICAL: stdin must be closed. With an open (inherited/pipe) stdin,
+      // the claude CLI blocks waiting for input/EOF and never starts working —
+      // it just sits there emitting nothing. 'ignore' gives it /dev/null so it
+      // sees no stdin and proceeds immediately. (stdout/stderr stay piped.)
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
   } catch (e) {
     send('error', { message: 'Failed to start claude: ' + String(e) })
@@ -118,8 +123,22 @@ export function runTask(req: TaskRequest, res: ServerResponse): void {
 
   send('start', { pid: child.pid, file: req.file })
 
+  // Safety net: if claude produces nothing for too long, surface it instead of
+  // hanging forever. (Generous — large repos can take a while to load.)
+  const STALL_MS = 90_000
+  let lastOutput = Date.now()
+  const stallCheck = setInterval(() => {
+    if (Date.now() - lastOutput > STALL_MS) {
+      send('error', { message: 'No output for 90s — claude may be stuck. Stopping.' })
+      clearInterval(stallCheck)
+      if (!child.killed) child.kill('SIGTERM')
+    }
+  }, 5000)
+  const bump = () => { lastOutput = Date.now() }
+
   let buffer = ''
   child.stdout.on('data', (chunk: Buffer) => {
+    bump()
     buffer += chunk.toString()
     // stream-json emits one JSON object per line
     const parts = buffer.split('\n')
@@ -136,10 +155,12 @@ export function runTask(req: TaskRequest, res: ServerResponse): void {
   })
 
   child.stderr.on('data', (chunk: Buffer) => {
+    bump()
     send('stderr', { text: chunk.toString() })
   })
 
   child.on('close', (code) => {
+    clearInterval(stallCheck)
     if (buffer.trim()) {
       try {
         send('message', JSON.parse(buffer.trim()))
@@ -152,12 +173,14 @@ export function runTask(req: TaskRequest, res: ServerResponse): void {
   })
 
   child.on('error', (err) => {
+    clearInterval(stallCheck)
     send('error', { message: String(err) })
     res.end()
   })
 
   // If the client disconnects, kill the child so we don't leak processes.
   res.on('close', () => {
+    clearInterval(stallCheck)
     if (!child.killed) child.kill('SIGTERM')
   })
 }
